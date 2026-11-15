@@ -46,6 +46,14 @@ Every agent has its own card, even when subagents share a Discord thread. Approv
 
 Footers show model and reasoning effort when available. The initial values are captured session settings, not per-turn execution telemetry. The source is tracked internally, and a daemon-reported model reroute updates that turn's model label. Later settings changes do not rewrite older cards. Recovered historical turns without a captured model are left unlabeled.
 
+## Usage cards
+
+`/codex usage` reads `account/rateLimits/read` on demand and renders an ephemeral Components V2 card. Monospace progress bars show the remaining percentage for each reported quota window; window labels come from the reported duration. Multiple quota buckets are supported, with up to four groups shown to keep the card compact. Discord timestamps display reset times relative to the reader. Explicit backend blocking takes precedence over apparently available percentages, and elapsed reset times never imply a refilled allowance.
+
+This read runs outside the bridge's serial work queue so a slow account service cannot delay approvals or turns. Account limits are fetched afresh and are not persisted. Unavailable limits, unsupported methods, and daemon disconnects produce a readable status rather than a guessed allowance.
+
+For eligible linked sessions, `thread/tokenUsage/updated` notifications persist the latest total, input, and output counters with a receipt timestamp in SQLite. A thread's usage card displays its top-level agent's latest snapshot, separately from account allowance; it does not sum subagents. Before the first notification, the card says it is waiting for usage data. Saved counters survive restarts and retain their last-reported timestamp, since the daemon may not replay token usage during reconnection.
+
 ## Recovery and delivery guarantees
 
 Codex is authoritative for conversation history and pending requests. Discordex stores event-derived deliveries before sending them and uses stable keys to ignore repeated events. It uses Discord nonces to reduce duplicate sends around network failures.
@@ -70,6 +78,7 @@ State and transcripts remain on disk. Automatic pruning is not implemented, and 
 | [`src/turns.ts`](../src/turns.ts) | Durable per-agent turn state and model snapshots |
 | [`src/render.ts`](../src/render.ts) | Logical output and prompt rendering |
 | [`src/components.ts`](../src/components.ts) | Compact Components V2 cards, footers, attachments, and controls |
+| [`src/usage.ts`](../src/usage.ts) | Remaining-allowance bars, quota windows, and reported session counters |
 | [`src/store.ts`](../src/store.ts) | SQLite mappings, inbox, outbox, approvals, and turn-card state |
 | [`src/types.ts`](../src/types.ts) | The supported subset of the Codex protocol |
 

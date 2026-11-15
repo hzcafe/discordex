@@ -1,11 +1,48 @@
 import { expect, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
-import { Events } from 'discord.js';
+import { ComponentType, Events, MessageFlags } from 'discord.js';
 import { DiscordAdapter } from '../src/discord.js';
 import { Bridge } from '../src/bridge.js';
 import { Store } from '../src/store.js';
 import type { Config } from '../src/config.js';
 import type { Binding, CodexPort } from '../src/types.js';
+
+test('usage is an ephemeral Components V2 card and an account read never occupies the bridge work queue', async () => {
+  const store = new Store(':memory:');
+  const config: Config = { guildId: 'guild', channelId: 'parent', allowedUserIds: ['alice'], approverUserIds: ['alice'],
+    autoDiscover: false, projectRoots: [], socketPath: '/unused', stateDir: '/unused' };
+  let release!: (value: any) => void;
+  const methods: string[] = [];
+  const codex = Object.assign(new EventEmitter(), { connected: true, epoch: 'one', request: async (method: string) => {
+    methods.push(method); return await new Promise(resolve => { release = resolve; });
+  }, respond: async () => {} }) as CodexPort;
+  const adapter = new DiscordAdapter(config, store);
+  const bridge = new Bridge(config, codex, store, adapter, () => {});
+  (adapter as any).bridge = bridge;
+  let deferred: any; let edited: any;
+  const interaction = {
+    isChatInputCommand: () => true, isButton: () => false, commandName: 'codex',
+    guildId: 'guild', channelId: 'parent', user: { id: 'alice' }, options: { getSubcommand: () => 'usage' },
+    deferReply: async (payload: any) => { deferred = payload; },
+    editReply: async (payload: any) => { edited = payload; },
+  };
+  try {
+    const pending = (adapter as any).interact(interaction);
+    await Bun.sleep(0);
+    expect(deferred.flags).toBe(MessageFlags.Ephemeral);
+    expect(await bridge.serial(async () => 'approval can proceed')).toBe('approval can proceed');
+    release({ rateLimits: { primary: { usedPercent: 35, windowDurationMins: 10080, resetsAt: null } } });
+    await pending;
+    expect(methods).toEqual(['account/rateLimits/read']);
+    expect(edited.flags).toBe(MessageFlags.IsComponentsV2);
+    const container = edited.components[0].toJSON();
+    expect(container.type).toBe(ComponentType.Container);
+    expect(JSON.stringify(container)).toContain('65% left');
+    expect(JSON.stringify(container)).toContain('█████████████░░░░░░░');
+    expect(edited.allowedMentions.parse).toEqual([]);
+    expect(edited.files).toHaveLength(0);
+  } finally { await adapter.close(); await bridge.stop(); store.close(); }
+});
 
 test('a disabled Message Content Intent fails startup with an actionable error instead of hanging', async () => {
   const store = new Store(':memory:');

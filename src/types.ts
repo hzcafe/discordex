@@ -41,6 +41,28 @@ export interface TurnState {
   // A selected model is a snapshot of session settings, not execution telemetry.
   model?: { name: string; effort: string | null; source: 'selected' | 'rerouted' } | null;
 }
+export interface RateLimitWindow {
+  usedPercent: number;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+export interface RateLimitSnapshot {
+  limitId?: string | null;
+  limitName?: string | null;
+  primary?: RateLimitWindow | null;
+  secondary?: RateLimitWindow | null;
+  rateLimitReachedType?: string | null;
+  spendControlReached?: boolean | null;
+}
+export interface AccountRateLimits {
+  ordinaryUsageAllowed?: boolean | null;
+  rateLimits?: RateLimitSnapshot | null;
+  rateLimitsByLimitId?: Record<string, RateLimitSnapshot | undefined> | null;
+}
+export interface TokenUsageSnapshot {
+  total: { totalTokens: number; inputTokens: number; outputTokens: number };
+  reportedAt: number;
+}
 export interface Binding {
   threadId: string;
   parentThreadId: string | null;

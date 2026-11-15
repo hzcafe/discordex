@@ -9,6 +9,7 @@ import { Store } from '../src/store.js';
 import type { Config } from '../src/config.js';
 import type { Binding, ChatPort, CodexPort, Delivery, Packet, Thread, Turn } from '../src/types.js';
 import { approvalDelivery, message, turnDelivery } from '../src/render.js';
+import type { AccountRateLimits } from '../src/types.js';
 
 const config: Config = { guildId: '1', channelId: 'index', allowedUserIds: ['alice', 'bob'], approverUserIds: ['alice'],
   autoDiscover: false, projectRoots: ['/work'], socketPath: '/codex.sock', stateDir: '/unused' };
@@ -23,10 +24,12 @@ class FakeCodex extends EventEmitter implements CodexPort {
   turns: Turn[] = [];
   queue: { id: string; clientUserMessageId: string }[] = [];
   failAdd = false;
+  rateLimits: AccountRateLimits = { rateLimits: { limitId: 'codex', primary: { usedPercent: 35, windowDurationMins: 10080, resetsAt: null } } };
   async request<T = any>(method: string, params: any = {}): Promise<T> {
     this.calls.push({ method, params });
     let result: any;
     if (method === 'thread/read') result = { thread: structuredClone(this.thread) };
+    else if (method === 'account/rateLimits/read') result = this.rateLimits;
     else if (method === 'thread/resume') result = { thread: this.thread };
     else if (method === 'thread/loaded/list') result = { data: [this.thread.id] };
     else if (method === 'thread/turns/list') result = { data: [...this.turns].reverse() };
@@ -67,6 +70,64 @@ function fixture(store = new Store(':memory:')) {
 function approval(id: string | number = 9): Packet {
   return { id, method: 'item/commandExecution/requestApproval', params: { threadId: 't1', turnId: 'turn1', itemId: 'command1', command: 'git status', availableDecisions: ['accept', 'decline'] } };
 }
+
+test('usage reads fresh account limits and remembers separate parent/subagent counters without posting messages', async () => {
+  const { bridge, codex, store, chat } = fixture();
+  store.saveBinding({ ...binding, threadId: 'child', parentThreadId: 't1' });
+  const update = (threadId: string, totalTokens: number) => bridge.notification({ method: 'thread/tokenUsage/updated', params: {
+    threadId, turnId: 'turn1', tokenUsage: { total: { totalTokens, inputTokens: totalTokens - 10, outputTokens: 10 } },
+  } });
+  await update('t1', 1000); await update('child', 2000); await update('untracked', 3000);
+  const first = await bridge.usage('c1', 'alice');
+  expect(first.content).toContain('65% left');
+  expect(first.content).toContain('Session tokens · 1,000 used');
+  expect(first.content).not.toContain('2,000');
+  expect(store.tokenUsage('untracked')).toBeNull();
+  expect(store.tokenUsage('child')?.total.totalTokens).toBe(2000);
+  codex.rateLimits.rateLimits!.primary!.usedPercent = 40;
+  const second = await bridge.usage('index', 'bob');
+  expect(second.content).toContain('60% left');
+  expect(second.content).not.toContain('Session tokens');
+  expect(codex.calls.filter(c => c.method === 'account/rateLimits/read')).toHaveLength(2);
+  expect(codex.calls.every(c => c.method === 'account/rateLimits/read')).toBe(true);
+  await bridge.flush(); expect(chat.sent).toHaveLength(0);
+});
+
+test('usage preserves last reported session counters across restart and handles unavailable account limits', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-usage-'));
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.sqlite');
+  const first = new Store(path);
+  first.saveTokenUsage('t1', { total: { totalTokens: 1000, inputTokens: 900, outputTokens: 100 }, reportedAt: 100 });
+  first.close();
+  const { bridge, codex } = fixture(new Store(path));
+  codex.connected = false;
+  const offline = await bridge.usage('c1', 'alice');
+  expect(offline.content).toContain('reconnecting');
+  expect(offline.content).toContain('1,000 used');
+  expect(offline.content).toContain('Last reported <t:100:R>');
+  expect(offline.content).not.toContain('% left');
+  expect(codex.calls).toHaveLength(0);
+  codex.connected = true;
+  codex.request = async () => { throw new RpcError(-32601, 'Method not found'); };
+  const unsupported = await bridge.usage('c1', 'alice');
+  expect(unsupported.content).toContain('not available from this Codex daemon');
+  expect(unsupported.content).toContain('1,000 used');
+  expect(unsupported.card?.tone).toBe('warning');
+});
+
+test('usage rejects unauthorized users, unknown channels, and excluded projects before querying the account', async () => {
+  const { bridge, codex, store } = fixture();
+  await expect(bridge.usage('c1', 'outsider')).rejects.toThrow('not configured');
+  await expect(bridge.usage('other', 'alice')).rejects.toThrow('configured Codex channel');
+  store.saveBinding({ ...binding, cwd: '/private' });
+  await expect(bridge.usage('c1', 'alice')).rejects.toThrow('outside');
+  await bridge.notification({ method: 'thread/tokenUsage/updated', params: { threadId: 't1', tokenUsage: {
+    total: { totalTokens: 100, inputTokens: 90, outputTokens: 10 },
+  } } });
+  expect(store.tokenUsage('t1')).toBeNull();
+  expect(codex.calls).toHaveLength(0);
+});
 
 test('reconnect recovers one final card and ignores replayed completed items', async () => {
   const { bridge, codex, chat, store } = fixture();

@@ -31,6 +31,8 @@ The two allowlists control actions:
 - **Contributors** can submit work from linked Discord threads.
 - **Approvers** can also answer supported approval and input prompts. Every approver must be a contributor.
 
+Contributors can run `/codex usage` in the configured channel or an eligible linked thread. Its response is visible only to the person who ran it. The allowance is for the host's Codex account, shared across sessions; Discord users do not get separate quotas. The command reads usage and cannot buy credits, consume resets, or change account settings.
+
 Discord channel membership controls **read access**. The bot's allowlists do not change channel visibility. Choose the server and channel membership to match who should see the exported conversations.
 
 Output, commands, and diffs are sent to Discord and stored locally for delivery. Self-hosting the bridge does not keep exported content off Discord. Keep `.env` and `discordex.config.json` out of version control; both are gitignored.
@@ -75,6 +77,8 @@ If it must keep running after your last login session ends, enable user lingerin
 | Human text does not reach Codex | Check Message Content Intent, `allowedUserIds`, and that the message is in a linked session thread. |
 | An approval cannot be answered | Check `approverUserIds` and whether the request is still pending. Some prompts require the local client. |
 | An old conversation is missing | First attachment exports the active turn and future work; it does not import the whole prior conversation. |
+| Usage says account limits are unavailable | Check daemon connectivity and whether the account's authentication supports the rate-limit endpoint. Rerun `/codex usage` after reconnecting. |
+| Session token counts are missing or old | Counters update when Codex emits a usage notification. The card shows the last reported snapshot, including after a restart; it does not infer missing usage from transcript length. |
 
 An inbox reaction means Discordex recorded the message, not that Codex has started or completed the work. An uncertain-submission warning means the daemon connection failed around submission; check the session before resending.
 

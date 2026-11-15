@@ -54,6 +54,7 @@ export class DiscordAdapter implements ChatPort {
       .addSubcommand(c => c.setName('attach').setDescription('Link an existing Codex session').addStringOption(o => o.setName('id').setDescription('Codex thread ID').setRequired(true)))
       .addSubcommand(c => c.setName('steer').setDescription('Send instructions into the active turn now').addStringOption(o => o.setName('message').setDescription('Instructions for Codex').setRequired(true)))
       .addSubcommand(c => c.setName('stop').setDescription('Interrupt the active turn'))
+      .addSubcommand(c => c.setName('usage').setDescription('Show remaining account allowance and session token usage'))
       .addSubcommand(c => c.setName('status').setDescription('Show bridge status'));
     // Upsert our command by name; do not overwrite other commands on the application.
     await channel.guild.commands.create(command);
@@ -144,10 +145,13 @@ export class DiscordAdapter implements ChatPort {
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       let result = 'Done';
+      let delivery: Delivery | undefined;
       const bridge = this.bridge!;
       if (interaction.isChatInputCommand()) {
         const sub = interaction.options.getSubcommand();
-        await bridge.serial(async () => {
+        // This read can wait on the account service without delaying approvals or turns.
+        if (sub === 'usage') delivery = await bridge.usage(channelId, interaction.user.id);
+        else await bridge.serial(async () => {
           if (sub === 'sessions') {
             const sessions = await bridge.sessions();
             result = sessions.length ? sessions.map(t => `\`${t.id}\` · ${t.name || basename(t.cwd)} · ${t.status.type}`).join('\n') : 'No eligible loaded sessions';
@@ -169,7 +173,7 @@ export class DiscordAdapter implements ChatPort {
         await bridge.serial(() => bridge.decide(token!, action!, channelId, interaction.user.id, answers));
         result = 'Response sent to Codex';
       }
-      await interaction.editReply(discordEditPayload(card(result, { title: 'Codex', tone: 'info' })));
+      await interaction.editReply(discordEditPayload(delivery ?? card(result, { title: 'Codex', tone: 'info' })));
     } catch (error) {
       const content = compact(error instanceof Error ? error.message : String(error));
       if (interaction.deferred || interaction.replied) await interaction.editReply(discordEditPayload(card(content, { title: 'Unable to complete that action', tone: 'warning' })));

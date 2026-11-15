@@ -4,7 +4,8 @@ import { RpcError } from './codex.js';
 import { Store } from './store.js';
 import { approvalDelivery, deliveryNonce, message, sessionCard } from './render.js';
 import { TurnCards } from './turns.js';
-import type { Binding, ChatPort, CodexPort, Packet, Thread, Turn } from './types.js';
+import { tokenUsageSnapshot, usageCard } from './usage.js';
+import type { AccountRateLimits, Binding, ChatPort, CodexPort, Delivery, Packet, Thread, Turn } from './types.js';
 
 export class Bridge {
   private chain: Promise<unknown> = Promise.resolve();
@@ -57,6 +58,30 @@ export class Bridge {
       const path = relative(root, thread.cwd);
       return path === '' || (path !== '..' && !path.startsWith('../') && !isAbsolute(path));
     });
+  }
+  async usage(channelId: string, userId: string): Promise<Delivery> {
+    if (!this.config.allowedUserIds.includes(userId)) throw new Error('You are not configured to control this bot');
+    const binding = this.store.byChannel(channelId);
+    if (channelId !== this.config.channelId && !binding) throw new Error('Use the configured Codex channel or a linked thread');
+    if (binding && !this.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) throw new Error('This project is outside the configured projectRoots');
+    const session = binding ? this.store.tokenUsage(binding.threadId) : undefined;
+    let limits: AccountRateLimits | null = null;
+    let unavailable: string | undefined;
+    if (!this.codex.connected) unavailable = 'Codex is reconnecting. Run `/codex usage` again shortly.';
+    else {
+      const epoch = this.codex.epoch;
+      try {
+        const response = await this.codex.request<AccountRateLimits>('account/rateLimits/read', { excludeResetCreditDetails: true });
+        if (epoch !== this.codex.epoch || !this.codex.connected) throw new Error('Codex reconnected during the usage read');
+        limits = response;
+      } catch (error) {
+        this.log(`Cannot read account limits: ${error}`);
+        unavailable = error instanceof RpcError && error.code === -32601
+          ? 'Account limits are not available from this Codex daemon.'
+          : 'Account limits are unavailable for this connection. Try `/codex usage` again shortly.';
+      }
+    }
+    return usageCard(limits, session, unavailable);
   }
   async sessions(): Promise<Thread[]> {
     const result: Thread[] = [];
@@ -171,7 +196,10 @@ export class Bridge {
     }
     const binding = this.store.binding(p.threadId);
     if (!binding || !this.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) return;
-    if (packet.method === 'item/started' || packet.method === 'item/completed') {
+    if (packet.method === 'thread/tokenUsage/updated') {
+      const usage = tokenUsageSnapshot(p.tokenUsage);
+      if (usage) this.store.saveTokenUsage(binding.threadId, usage);
+    } else if (packet.method === 'item/started' || packet.method === 'item/completed') {
       this.store.saveItem(binding.threadId, p.item);
       if (p.item.type === 'userMessage' && p.item.clientId) this.confirmInput(p.item.clientId);
       this.turns.item(binding, p.turnId, p.item, packet.method === 'item/completed');

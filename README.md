@@ -120,9 +120,12 @@ For an always-on installation, use the [Linux background-service guide](docs/con
 | Add instructions to work in progress | `/codex steer message:<instructions>` |
 | Interrupt the current turn | `/codex stop` |
 | Inspect connectivity | `/codex status` |
+| View remaining allowance and token usage | `/codex usage` |
 | Answer an approval or question | Use the buttons or modal on its prompt card |
 
 Every allowed user's text in a linked thread reaches Codex, including discussion between friends. Messages in the index channel stay there; bot and webhook messages are ignored.
+
+`/codex usage` replies privately with a compact card: a progress bar and percentage remaining for each reported allowance window, plus its reset time in your Discord locale. These limits belong to the host's Codex account and are shared across sessions. In a linked thread, the card also shows the main agent's last reported session token counts. Run the command again for a fresh account snapshot; missing data is shown as unavailable, never as zero.
 
 Each agent turn gets **one message that keeps updating**: working, running a command, editing files, completed commentary, then the final response. Longer final answers include the full text as a file attachment. Approval prompts have separate cards so progress updates never hide a pending decision. Partial token streams and private reasoning text are not exported.
 

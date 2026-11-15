@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Binding, Delivery, Item, Packet, TurnState } from './types.js';
+import type { Binding, Delivery, Item, Packet, TokenUsageSnapshot, TurnState } from './types.js';
 
 export interface Outgoing { key: string; channel: string; payload: string; message: string | null; attempts: number; revision: number }
 export interface Approval { token: string; epoch: string; rpcId: string; threadId: string; channel: string; packet: string; state: string }
@@ -38,6 +38,11 @@ export class Store {
   }
   getMeta(key: string): string | null { return this.db.query<{ value: string }, [string]>('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null; }
   setMeta(key: string, value: string): void { this.db.query('INSERT OR REPLACE INTO meta VALUES (?, ?)').run(key, value); }
+  tokenUsage(threadId: string): TokenUsageSnapshot | null {
+    const value = this.getMeta(`token-usage:${threadId}`);
+    return value ? JSON.parse(value) : null;
+  }
+  saveTokenUsage(threadId: string, usage: TokenUsageSnapshot): void { this.setMeta(`token-usage:${threadId}`, JSON.stringify(usage)); }
   claim(context: string): void {
     this.db.transaction(() => {
       const previous = this.getMeta('context');
