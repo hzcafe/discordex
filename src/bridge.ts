@@ -2,8 +2,9 @@ import { relative, isAbsolute, basename } from 'node:path';
 import type { Config } from './config.js';
 import { RpcError } from './codex.js';
 import { Store } from './store.js';
-import { approvalDelivery, card, deliveryNonce, itemDelivery, message, sessionCard, turnDelivery } from './render.js';
-import type { Binding, ChatPort, CodexPort, Item, Packet, Thread, Turn, Verbosity } from './types.js';
+import { approvalDelivery, deliveryNonce, message, sessionCard } from './render.js';
+import { TurnCards } from './turns.js';
+import type { Binding, ChatPort, CodexPort, Packet, Thread, Turn } from './types.js';
 
 export class Bridge {
   private chain: Promise<unknown> = Promise.resolve();
@@ -13,9 +14,10 @@ export class Bridge {
   private subscribed = new Set<string>();
   private stopped = false;
   private listeners: { event: string; listener: (...args: any[]) => void }[] = [];
+  private turns: TurnCards;
 
   constructor(readonly config: Config, readonly codex: CodexPort, readonly store: Store,
-    private chat: ChatPort, private log: (text: string) => void = console.error) {}
+    private chat: ChatPort, private log: (text: string) => void = console.error) { this.turns = new TurnCards(store); }
 
   // Codex notifications and human submissions share one ordering boundary.
   serial<T>(work: () => Promise<T>): Promise<T> {
@@ -84,18 +86,25 @@ export class Bridge {
       const channelId = parent?.channelId ?? await this.chat.createThread(thread);
       binding = { threadId, channelId, parentThreadId: thread.parentThreadId ?? null,
         label: thread.agentNickname || thread.name || basename(thread.cwd) || 'Codex', cwd: thread.cwd,
-        verbosity: parent?.verbosity ?? this.config.verbosity, since: Date.now() / 1000,
+        since: Date.now() / 1000,
         initialTurnId: active?.id ?? null, checkpoint: page.data.find(t => t.status !== 'inProgress')?.id ?? null };
       this.store.saveBinding(binding);
       this.store.enqueue(`attached:${threadId}`, channelId, sessionCard(binding));
     }
+    this.saveModelSettings(binding, thread.model, thread.reasoningEffort);
     await this.subscribe(binding);
     return binding;
   }
   private async subscribe(binding: Binding): Promise<void> {
     if (this.subscribed.has(binding.threadId)) return;
-    await this.codex.request('thread/resume', { threadId: binding.threadId, excludeTurns: true });
+    const response = await this.codex.request<{ thread: Thread; model?: string; reasoningEffort?: string | null }>('thread/resume', { threadId: binding.threadId, excludeTurns: true });
+    this.saveModelSettings(binding, response.model ?? response.thread.model, response.reasoningEffort ?? response.thread.reasoningEffort);
     this.subscribed.add(binding.threadId);
+  }
+  private saveModelSettings(binding: Binding, model?: string | null, effort?: string | null): void {
+    binding.model = model ?? null;
+    binding.reasoningEffort = effort ?? null;
+    this.store.saveBinding(binding);
   }
   async sync(): Promise<void> {
     if (this.stopped || !this.codex.connected) return;
@@ -134,20 +143,16 @@ export class Bridge {
         this.store.saveItem(binding.threadId, item);
         if (item.type === 'userMessage' && item.clientId) this.confirmInput(item.clientId);
       }
+      this.turns.reconcile(binding, turn);
       if (turn.status !== 'inProgress') {
-        for (const item of turn.items ?? []) this.emitItem(binding, turn.id, item);
         this.completeTurn(binding, turn);
         binding.checkpoint = turn.id;
       }
     }
     this.store.saveBinding(binding);
   }
-  private emitItem(binding: Binding, turnId: string, item: Item): void {
-    const delivery = itemDelivery(binding, item);
-    if (delivery) this.store.enqueue(`item:${binding.threadId}:${turnId}:${item.id}`, binding.channelId, delivery);
-  }
   private completeTurn(binding: Binding, turn: Turn): void {
-    this.store.enqueue(`turn:${binding.threadId}:${turn.id}`, binding.channelId, turnDelivery(binding, turn));
+    this.turns.complete(binding, turn);
     for (const approval of this.store.pendingApprovals()) {
       const packet: Packet = JSON.parse(approval.packet);
       if (approval.threadId === binding.threadId && packet.params?.turnId === turn.id) this.finishApproval(approval.token, 'resolved');
@@ -169,14 +174,27 @@ export class Bridge {
     if (packet.method === 'item/started' || packet.method === 'item/completed') {
       this.store.saveItem(binding.threadId, p.item);
       if (p.item.type === 'userMessage' && p.item.clientId) this.confirmInput(p.item.clientId);
-      if (packet.method === 'item/completed') this.emitItem(binding, p.turnId, p.item);
+      this.turns.item(binding, p.turnId, p.item, packet.method === 'item/completed');
     } else if (packet.method === 'turn/completed') {
       // The completion payload need not contain items; hydrate durable history first.
       await this.reconcile(binding);
       this.completeTurn(binding, p.turn);
       if (!binding.parentThreadId) await this.drainInputs(binding);
-    } else if (packet.method === 'turn/started' && binding.verbosity !== 'quiet') {
-      this.store.enqueue(`started:${binding.threadId}:${p.turn.id}`, binding.channelId, card('Working', { title: binding.label, tone: 'info', compact: true, hideHeader: !binding.parentThreadId }));
+    } else if (packet.method === 'turn/started') {
+      // The live read captures selected settings; it does not assert execution
+      // identity. Later settings changes are only used for subsequent cards.
+      try {
+        const { thread } = await this.codex.request<{ thread: Thread }>('thread/read', { threadId: binding.threadId });
+        this.saveModelSettings(binding, thread.model, thread.reasoningEffort);
+      } catch (error) {
+        this.saveModelSettings(binding, null, null);
+        this.log(`Cannot read model settings for ${binding.threadId}: ${error}`);
+      }
+      this.turns.start(binding, p.turn);
+    } else if (packet.method === 'thread/settings/updated') {
+      this.saveModelSettings(binding, p.threadSettings?.model, p.threadSettings?.effort);
+    } else if (packet.method === 'model/rerouted' && typeof p.turnId === 'string' && typeof p.toModel === 'string') {
+      this.turns.rerouted(binding, p.turnId, p.toModel);
     } else if (packet.method === 'thread/name/updated' && typeof p.threadName === 'string') {
       binding.label = p.threadName; this.store.saveBinding(binding);
     }
@@ -195,12 +213,16 @@ export class Bridge {
     }
     const approval = this.store.addApproval(this.codex.epoch, packet, binding.channelId);
     this.store.enqueue(`approval:${approval.token}`, binding.channelId, approvalDelivery(approval, binding));
+    if (packet.params?.turnId) this.turns.refresh(binding, packet.params.turnId, true);
     void this.flush();
   }
   private finishApproval(token: string, state: string): void {
     this.store.approvalState(token, state);
     const approval = this.store.approval(token)!;
-    this.store.revise(`approval:${token}`, approvalDelivery(approval, this.store.binding(approval.threadId)));
+    const binding = this.store.binding(approval.threadId);
+    this.store.revise(`approval:${token}`, approvalDelivery(approval, binding));
+    const packet: Packet = JSON.parse(approval.packet);
+    if (binding && packet.params?.turnId) this.turns.refresh(binding, packet.params.turnId);
   }
   private expireApprovals(): void { for (const a of this.store.pendingApprovals()) this.finishApproval(a.token, 'expired'); }
   async decide(token: string, action: string, channelId: string, userId: string, answers?: Record<string, string>): Promise<void> {
@@ -300,10 +322,6 @@ export class Bridge {
       await this.codex.request('turn/steer', { threadId: binding.threadId, expectedTurnId: turn.id, clientUserMessageId: interactionId,
         input: [{ type: 'text', text: `[Discord: ${name}; user ID: ${userId}]\n${text}`, text_elements: [] }] });
     }
-  }
-  verbosity(channelId: string, verbosity: Verbosity): void {
-    this.requireBinding(channelId);
-    for (const binding of this.store.bindings().filter(b => b.channelId === channelId)) { binding.verbosity = verbosity; this.store.saveBinding(binding); }
   }
   private requireBinding(channelId: string): Binding {
     const binding = this.store.byChannel(channelId);

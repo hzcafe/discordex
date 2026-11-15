@@ -7,7 +7,7 @@ Runs on **Bun**. The bridge reads structured app-server events over Codex's Unix
 ## Current functionality
 
 - Discover loaded sessions within configured project roots and create one Discord thread per top-level conversation. Subagents share their parent's Discord thread, with their own labels.
-- Publish replies in compact Discord Components V2 cards, with a small agent/type footer, brief turn status, and approval buttons grouped with the request. Subagent replies carry their own name in the footer. Choose quiet, progress, or verbose output per conversation. Long output is attached in full through a file component.
+- Keep one compact Discord Components V2 card per agent turn. It updates with commentary and current activity, then becomes the final response with a small agent/status footer. Subagent cards carry their own name. Long final output is attached in full through a file component.
 - Queue ordinary Discord messages with the sender's identity. Explicit commands steer or interrupt the current turn.
 - Answer command, file-change, and permission approvals with buttons; answer user-input questions with a modal. Decisions are one-time or turn-scoped, never permanent policy changes.
 - Persist mappings, incoming messages, outgoing messages, and approval state using `bun:sqlite`. Recover missed Codex output and Discord messages after reconnecting.
@@ -62,10 +62,13 @@ Every text message from an allowed user inside a linked thread is submitted to C
 | Send work for the next turn | Send a normal message in the linked thread |
 | Add instructions to work in progress | `/codex steer message:<instructions>` |
 | Interrupt the current turn | `/codex stop` |
-| Change output detail | `/codex verbosity level:quiet`, `progress`, or `verbose` |
 | Inspect connectivity | `/codex status` |
 
-Quiet mode publishes final assistant messages, turn completion/failure, and prompts. Progress adds completed commentary messages and turn-start status. Verbose adds command output, tool status, and file diffs. Token-by-token editing is not implemented. Reasoning items are not exported.
+Each turn gets one message that is edited as work progresses: working, running a command, editing files, or completed commentary. On completion, the same card contains the final response; interruptions and failures remain visible in its status. Edits are coalesced with at least one second between successful updates to a turn card, and retries preserve backoff. Completed assistant text is authoritative; partial token streams and reasoning text are not exported. There are no verbosity modes; legacy `verbosity` settings are ignored.
+
+Approval and input prompts have separate cards so progress edits cannot remove a pending decision. Reconnects recover turn state and edit the original card. Multiple agents each have their own turn card in the shared Discord thread.
+
+Turn footers include the model name and reasoning effort when available. The source is tracked internally: the initial values are captured session settings, not per-turn execution telemetry. A daemon-reported model reroute updates that turn's model label. Later session settings changes do not rewrite older cards, and recovered historical turns without a captured model are left unlabeled.
 
 An inbox reaction means Discordex has recorded the message. It is not a claim that Codex has finished—or even started—the requested work. An uncertain-submission warning means the daemon connection failed around a submission; check the session before resending.
 
@@ -84,7 +87,6 @@ Attachments and voice messages are not ingested in this version. Text accompanyi
 | `approverUserIds` | Required nonempty list of approvers |
 | `autoDiscover` | `true`; automatically link eligible loaded sessions |
 | `projectRoots` | `[]`; all projects. Otherwise absolute roots, including their descendants |
-| `verbosity` | `quiet`; initial setting for new threads |
 | `socketPath` | `$CODEX_HOME/app-server-control/app-server-control.sock`, with `CODEX_HOME` defaulting to `~/.codex` |
 | `stateDir` | `$XDG_STATE_HOME/discordex`, defaulting to `~/.local/state/discordex` |
 

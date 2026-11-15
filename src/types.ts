@@ -1,7 +1,6 @@
 // The subset of the Codex 0.169.0 app-server protocol used by Discordex.
 // Keep wire names aligned with `codex app-server generate-ts --experimental`.
 export type RequestId = string | number;
-export type Verbosity = 'quiet' | 'progress' | 'verbose';
 export type JsonObject = Record<string, any>;
 export interface Packet {
   id?: RequestId;
@@ -18,6 +17,8 @@ export interface Thread {
   parentThreadId?: string | null;
   agentNickname?: string | null;
   canAcceptDirectInput?: boolean | null;
+  model?: string | null;
+  reasoningEffort?: string | null;
   status: { type: string; activeFlags?: string[] };
   turns?: Turn[];
 }
@@ -33,13 +34,21 @@ export interface Turn {
   items?: Item[];
   error?: { message: string } | null;
 }
+export interface TurnState {
+  turn: Turn;
+  completedItemIds: string[];
+  lastItemId: string | null;
+  // A selected model is a snapshot of session settings, not execution telemetry.
+  model?: { name: string; effort: string | null; source: 'selected' | 'rerouted' } | null;
+}
 export interface Binding {
   threadId: string;
   parentThreadId: string | null;
   channelId: string;
   label: string;
   cwd: string;
-  verbosity: Verbosity;
+  model?: string | null;
+  reasoningEffort?: string | null;
   // Initial history boundary: a binding exports the active turn and future turns.
   since: number;
   initialTurnId: string | null;

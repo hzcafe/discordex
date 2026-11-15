@@ -26,9 +26,9 @@ test('a disabled Message Content Intent fails startup with an actionable error i
 test('Discord history recovery paginates, filters bot/unauthorized messages, and deduplicates live echoes', async () => {
   const store = new Store(':memory:');
   const config: Config = { guildId: 'guild', channelId: 'parent', allowedUserIds: ['alice'], approverUserIds: ['alice'],
-    autoDiscover: false, projectRoots: ['/work'], verbosity: 'quiet', socketPath: '/unused', stateDir: '/unused' };
+    autoDiscover: false, projectRoots: ['/work'], socketPath: '/unused', stateDir: '/unused' };
   const binding: Binding = { threadId: 't1', parentThreadId: null, channelId: '100', label: 'Project', cwd: '/work',
-    since: 0, initialTurnId: null, checkpoint: null, verbosity: 'quiet' };
+    since: 0, initialTurnId: null, checkpoint: null };
   store.saveBinding(binding);
   const codex = Object.assign(new EventEmitter(), { connected: false, epoch: 'offline', request: async () => ({}), respond: async () => {} }) as CodexPort;
   const adapter = new DiscordAdapter(config, store);
@@ -62,7 +62,7 @@ test('Discord history recovery paginates, filters bot/unauthorized messages, and
 test('restart reuses an existing Discord thread when its channel is not cached', async () => {
   const store = new Store(':memory:');
   const config = { guildId: 'guild', channelId: 'parent', allowedUserIds: ['alice'], approverUserIds: ['alice'],
-    autoDiscover: false, projectRoots: [], verbosity: 'quiet', socketPath: '/unused', stateDir: '/unused' } as Config;
+    autoDiscover: false, projectRoots: [], socketPath: '/unused', stateDir: '/unused' } as Config;
   const adapter = new DiscordAdapter(config, store);
   let starts = 0;
   store.setMeta('starter:t1', 'saved-starter');

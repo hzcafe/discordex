@@ -1,6 +1,5 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
-import type { Verbosity } from './types.js';
 
 export interface Config {
   guildId: string;
@@ -9,7 +8,6 @@ export interface Config {
   approverUserIds: string[];
   autoDiscover: boolean;
   projectRoots: string[];
-  verbosity: Verbosity;
   socketPath: string;
   stateDir: string;
 }
@@ -30,8 +28,6 @@ export async function readConfig(path = process.env.DISCORDEX_CONFIG || 'discord
   if (!value.approverUserIds.every((id: string) => value.allowedUserIds.includes(id))) {
     throw new Error('Every approver must also appear in allowedUserIds');
   }
-  const verbosity = value.verbosity ?? 'quiet';
-  if (!['quiet', 'progress', 'verbose'].includes(verbosity)) throw new Error('Invalid verbosity');
   const projectRoots = value.projectRoots ?? [];
   if (!Array.isArray(projectRoots) || !projectRoots.every((p: unknown) => typeof p === 'string' && isAbsolute(p))) {
     throw new Error('projectRoots must be an array of absolute paths (empty means all projects)');
@@ -43,5 +39,5 @@ export async function readConfig(path = process.env.DISCORDEX_CONFIG || 'discord
   if (typeof stateDir !== 'string' || !isAbsolute(stateDir)) throw new Error('stateDir must be absolute');
   return { guildId: value.guildId, channelId: value.channelId, allowedUserIds: value.allowedUserIds,
     approverUserIds: value.approverUserIds, autoDiscover: value.autoDiscover ?? true,
-    projectRoots: projectRoots.map((p: string) => resolve(p)), verbosity, socketPath, stateDir };
+    projectRoots: projectRoots.map((p: string) => resolve(p)), socketPath, stateDir };
 }

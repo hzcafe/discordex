@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Binding, Delivery, Item, Packet } from './types.js';
+import type { Binding, Delivery, Item, Packet, TurnState } from './types.js';
 
 export interface Outgoing { key: string; channel: string; payload: string; message: string | null; attempts: number; revision: number }
 export interface Approval { token: string; epoch: string; rpcId: string; threadId: string; channel: string; packet: string; state: string }
@@ -33,6 +33,7 @@ export class Store {
         state TEXT NOT NULL DEFAULT 'new', queueId TEXT
       );
       CREATE TABLE IF NOT EXISTS items (threadId TEXT, itemId TEXT, json TEXT, PRIMARY KEY(threadId, itemId));
+      CREATE TABLE IF NOT EXISTS turn_cards (threadId TEXT, turnId TEXT, json TEXT NOT NULL, PRIMARY KEY(threadId, turnId));
     `);
   }
   getMeta(key: string): string | null { return this.db.query<{ value: string }, [string]>('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? null; }
@@ -73,7 +74,8 @@ export class Store {
   }
   delivered(row: Outgoing, message: string): void {
     // A resolution may revise an approval while Discord's send is in flight.
-    this.db.query('UPDATE outbox SET message = ?, pending = CASE WHEN revision = ? THEN 0 ELSE 1 END, attempts = 0 WHERE key = ?').run(message, row.revision, row.key);
+    this.db.query('UPDATE outbox SET message = ?, pending = CASE WHEN revision = ? THEN 0 ELSE 1 END, attempts = 0, nextAttempt = ? WHERE key = ?')
+      .run(message, row.revision, row.key.startsWith('turn:') ? Date.now() + 1000 : 0, row.key);
   }
   retry(row: Outgoing): void {
     this.db.query('UPDATE outbox SET attempts = attempts + 1, nextAttempt = ? WHERE key = ?').run(Date.now() + Math.min(300_000, 1000 * 2 ** Math.min(row.attempts, 8)), row.key);
@@ -108,6 +110,20 @@ export class Store {
   item(threadId: string, itemId: string): Item | undefined {
     const row = this.db.query<{ json: string }, [string, string]>('SELECT json FROM items WHERE threadId = ? AND itemId = ?').get(threadId, itemId);
     return row ? JSON.parse(row.json) : undefined;
+  }
+  turnState(threadId: string, turnId: string): TurnState | undefined {
+    const row = this.db.query<{ json: string }, [string, string]>('SELECT json FROM turn_cards WHERE threadId = ? AND turnId = ?').get(threadId, turnId);
+    return row ? JSON.parse(row.json) : undefined;
+  }
+  publishTurn(binding: Binding, state: TurnState, delivery: Delivery): void {
+    this.db.transaction(() => {
+      this.db.query('INSERT OR REPLACE INTO turn_cards VALUES (?, ?, ?)').run(binding.threadId, state.turn.id, JSON.stringify(state));
+      // Coalesce edits without resetting rate-limit cooldowns or failure backoff.
+      this.db.query(`INSERT INTO outbox (key, channel, payload) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, pending = 1, revision = outbox.revision + 1
+        WHERE outbox.payload != excluded.payload`)
+        .run(`turn:${binding.threadId}:${state.turn.id}`, binding.channelId, JSON.stringify(delivery));
+    })();
   }
   close(): void { this.db.close(); }
 }

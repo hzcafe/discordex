@@ -15,7 +15,9 @@ test('configuration requires explicit identities and rejects approvers outside t
   await expect(readConfig(path)).rejects.toThrow('Every approver');
   value.approverUserIds = [...value.allowedUserIds];
   await Bun.write(path, JSON.stringify(value));
-  expect((await readConfig(path)).verbosity).toBe('quiet');
+  expect((await readConfig(path)).autoDiscover).toBe(true);
+  await Bun.write(path, JSON.stringify({ ...value, verbosity: 'quiet' }));
+  expect('verbosity' in await readConfig(path)).toBe(false); // Old settings are harmless.
   await Bun.write(path, JSON.stringify({ ...value, projectRoots: ['relative/path'] }));
   await expect(readConfig(path)).rejects.toThrow('absolute paths');
 });

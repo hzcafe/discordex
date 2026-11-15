@@ -4,6 +4,5 @@
   "allowedUserIds": ["YOUR_DISCORD_USER_ID"],
   "approverUserIds": ["YOUR_DISCORD_USER_ID"],
   "autoDiscover": true,
-  "projectRoots": ["/absolute/path/to/your/project"],
-  "verbosity": "quiet"
+  "projectRoots": ["/absolute/path/to/your/project"]
 }

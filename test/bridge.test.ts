@@ -8,12 +8,12 @@ import { RpcError } from '../src/codex.js';
 import { Store } from '../src/store.js';
 import type { Config } from '../src/config.js';
 import type { Binding, ChatPort, CodexPort, Delivery, Packet, Thread, Turn } from '../src/types.js';
-import { approvalDelivery, itemDelivery, message } from '../src/render.js';
+import { approvalDelivery, message, turnDelivery } from '../src/render.js';
 
 const config: Config = { guildId: '1', channelId: 'index', allowedUserIds: ['alice', 'bob'], approverUserIds: ['alice'],
-  autoDiscover: false, projectRoots: ['/work'], verbosity: 'quiet', socketPath: '/codex.sock', stateDir: '/unused' };
+  autoDiscover: false, projectRoots: ['/work'], socketPath: '/codex.sock', stateDir: '/unused' };
 const binding: Binding = { threadId: 't1', channelId: 'c1', parentThreadId: null, label: 'Project', cwd: '/work/project',
-  verbosity: 'quiet', since: 0, initialTurnId: null, checkpoint: null };
+  since: 0, initialTurnId: null, checkpoint: null };
 
 class FakeCodex extends EventEmitter implements CodexPort {
   connected = true; epoch = 'connection-1';
@@ -68,8 +68,9 @@ function approval(id: string | number = 9): Packet {
   return { id, method: 'item/commandExecution/requestApproval', params: { threadId: 't1', turnId: 'turn1', itemId: 'command1', command: 'git status', availableDecisions: ['accept', 'decline'] } };
 }
 
-test('reconnect recovers missed final output and completion once, preserving quiet mode', async () => {
+test('reconnect recovers one final card and ignores replayed completed items', async () => {
   const { bridge, codex, chat, store } = fixture();
+  codex.thread.model = 'new-session-model'; // Must not be attributed to older history.
   codex.turns = [{ id: 'turn1', status: 'completed', completedAt: 10, items: [
     { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Working' },
     { id: 'private', type: 'reasoning', text: 'internal reasoning' },
@@ -79,9 +80,10 @@ test('reconnect recovers missed final output and completion once, preserving qui
   await bridge.sync(); await bridge.flush();
   await bridge.notification({ method: 'item/completed', params: { threadId: 't1', turnId: 'turn1', item: codex.turns[0]!.items![2] } });
   await bridge.flush();
-  expect(chat.sent).toHaveLength(2);
+  expect(chat.sent).toHaveLength(1);
   expect(chat.sent[0]!.delivery.content).toContain('Fixed the bug.');
-  expect(chat.sent[1]!.delivery.content).toContain('Turn complete');
+  expect(chat.sent[0]!.delivery.card?.footer).toBe('Codex · Complete');
+  expect(chat.edits).toHaveLength(0);
   expect(store.binding('t1')!.checkpoint).toBe('turn1');
 });
 
@@ -93,7 +95,7 @@ test('history before first attachment is not exported, but an already-active tur
     { id: 'active', status: 'completed', completedAt: 90, items: [{ id: 'b', type: 'agentMessage', text: 'current' }] },
   ];
   await bridge.sync(); await bridge.flush();
-  expect(chat.sent).toHaveLength(2);
+  expect(chat.sent).toHaveLength(1);
   expect(chat.sent[0]!.delivery.content).toContain('current');
 });
 
@@ -212,7 +214,7 @@ test('one approval decision is sent, only offered decisions are accepted, and lo
   expect(codex.responses).toEqual([{ id: 9, result: { decision: 'accept' } }]);
   await bridge.notification({ method: 'serverRequest/resolved', params: { threadId: 't1', requestId: 9 } });
   await bridge.flush();
-  expect(chat.edits.at(-1)!.delivery.buttons).toEqual([]);
+  expect(chat.edits.find(e => e.delivery.buttons)?.delivery.buttons).toEqual([]);
   expect(store.approval(a.token)!.state).toBe('resolved');
 });
 
@@ -283,12 +285,13 @@ test('approval resolution while Discord is sending schedules an edit', async () 
   const { bridge, chat, store } = fixture();
   let release!: () => void;
   const original = chat.send.bind(chat);
-  chat.send = async (...args) => { await new Promise<void>(resolve => { release = resolve; }); return original(...args); };
+  let first = true;
+  chat.send = async (...args) => { if (first) { first = false; await new Promise<void>(resolve => { release = resolve; }); } return original(...args); };
   await bridge.serverRequest(approval());
   await Bun.sleep(0);
   await bridge.notification({ method: 'serverRequest/resolved', params: { threadId: 't1', requestId: 9 } });
   release(); await Bun.sleep(0); await bridge.flush();
-  expect(chat.edits.at(-1)!.delivery.buttons).toEqual([]);
+  expect(chat.edits.find(e => e.delivery.buttons)?.delivery.buttons).toEqual([]);
   expect(store.pendingApprovals()).toHaveLength(0);
 });
 
@@ -297,6 +300,179 @@ test('long output is preserved as an attachment and moderated/reasoning output i
   const rendered = message(text);
   expect(rendered.content.length).toBeLessThanOrEqual(2000);
   expect(rendered.file!.content).toBe(text);
-  expect(itemDelivery(binding, { id: 'x', type: 'agentMessage', text: 'blocked', moderation: { moderated: true } })).toBeUndefined();
-  expect(itemDelivery({ ...binding, verbosity: 'verbose' }, { id: 'x', type: 'reasoning', text: 'hidden' })).toBeUndefined();
+  const delivery = turnDelivery(binding, { turn: { id: 't', status: 'completed', items: [
+    { id: 'x', type: 'agentMessage', text: 'blocked', moderation: { moderated: true } },
+    { id: 'y', type: 'reasoning', text: 'hidden' },
+  ] }, completedItemIds: ['x', 'y'], lastItemId: 'y' });
+  expect(delivery.content).not.toContain('blocked');
+  expect(delivery.content).not.toContain('hidden');
+});
+
+test('one turn card changes from working to command and commentary to the final answer', async () => {
+  const { bridge, chat, store } = fixture();
+  const event = async (method: string, item: any) => bridge.notification({ method, params: { threadId: 't1', turnId: 'live', item } });
+  const tick = async () => { store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush(); };
+  await bridge.notification({ method: 'turn/started', params: { threadId: 't1', turn: { id: 'live', status: 'inProgress' } } });
+  await bridge.flush();
+  expect(chat.sent).toHaveLength(1);
+  expect(chat.sent[0]!.delivery.content).toBe('Working…');
+  await event('item/started', { id: 'cmd', type: 'commandExecution', command: 'bun test', status: 'inProgress' });
+  await bridge.flush();
+  expect(chat.edits).toHaveLength(0); // Successful sends impose a one-second cooldown.
+  await tick();
+  expect(chat.edits.at(-1)!.delivery.content).toBe('Running `bun test`');
+  await event('item/completed', { id: 'cmd', type: 'commandExecution', command: 'bun test', status: 'completed' });
+  await event('item/completed', { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Tests passed; checking the result.' });
+  await tick();
+  expect(chat.edits.at(-1)!.delivery.content).toBe('Tests passed; checking the result.');
+  await event('item/completed', { id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'Fixed and tested.' });
+  await bridge.notification({ method: 'turn/completed', params: { threadId: 't1', turn: { id: 'live', status: 'completed', items: [] } } });
+  await event('item/started', { id: 'late', type: 'commandExecution', command: 'stale command' });
+  await tick();
+  expect(chat.sent).toHaveLength(1);
+  expect(new Set(chat.edits.map(e => e.id))).toEqual(new Set([chat.sent[0]!.id]));
+  expect(chat.edits.at(-1)!.delivery.content).toBe('Fixed and tested.');
+  expect(chat.edits.at(-1)!.delivery.card?.footer).toBe('Codex · Complete');
+});
+
+test('a restart recovers active progress then edits the original message with all final answer parts', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-turn-'));
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.sqlite');
+  const first = new Store(path); first.saveBinding({ ...binding });
+  const oldCodex = new FakeCodex();
+  oldCodex.thread.model = 'original-model'; oldCodex.thread.reasoningEffort = 'high';
+  const oldBridge = new Bridge(config, oldCodex, first, new FakeChat(), () => {});
+  await oldBridge.notification({ method: 'turn/started', params: { threadId: 't1', turn: { id: 'live', status: 'inProgress' } } });
+  await oldBridge.flush(); await oldBridge.stop(); first.close();
+  const { bridge, codex, chat, store } = fixture(new Store(path));
+  codex.thread.model = 'future-model'; codex.thread.reasoningEffort = 'low';
+  codex.turns = [{ id: 'live', status: 'inProgress', items: [{ id: 'cmd', type: 'commandExecution', command: 'bun test', status: 'inProgress' }] }];
+  await bridge.sync(); store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  expect(chat.sent).toHaveLength(0);
+  expect(chat.edits.at(-1)!.id).toBe('message-0');
+  expect(chat.edits.at(-1)!.delivery.content).toBe('Running `bun test`');
+  expect(chat.edits.at(-1)!.delivery.card?.footer).toBe('Codex · original-model · high · Working');
+  codex.turns = [{ id: 'live', status: 'completed', completedAt: 20, items: [
+    { id: 'comment', type: 'agentMessage', phase: 'commentary', text: 'Checking…' },
+    { id: 'part', type: 'agentMessage', phase: 'partial_answer', text: 'First result.' },
+    { id: 'final', type: 'agentMessage', phase: 'final_answer', text: 'Second result.' },
+  ] }];
+  await bridge.sync(); store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  expect(chat.sent).toHaveLength(0);
+  expect(chat.edits.at(-1)!.delivery.content).toBe('First result.\n\nSecond result.');
+  expect(chat.edits.at(-1)!.delivery.card?.footer).toBe('Codex · original-model · high · Complete');
+});
+
+test('model settings are captured per turn and reported reroutes override that turn only', async () => {
+  const { bridge, codex, store } = fixture();
+  const footer = (id: string) => JSON.parse(store.db.query<{ payload: string }, [string]>('SELECT payload FROM outbox WHERE key = ?').get(`turn:t1:${id}`)!.payload).card.footer;
+  codex.thread.model = 'model-a'; codex.thread.reasoningEffort = 'high';
+  await bridge.notification({ method: 'turn/started', params: { threadId: 't1', turn: { id: 'first', status: 'inProgress' } } });
+  expect(footer('first')).toBe('Codex · model-a · high · Working');
+  codex.thread.model = 'model-b'; codex.thread.reasoningEffort = 'low';
+  await bridge.notification({ method: 'thread/settings/updated', params: { threadId: 't1', threadSettings: { model: 'model-b', effort: 'low' } } });
+  await bridge.notification({ method: 'item/started', params: { threadId: 't1', turnId: 'first', item: { id: 'c', type: 'commandExecution', command: 'bun test' } } });
+  expect(footer('first')).toBe('Codex · model-a · high · Working');
+  await bridge.notification({ method: 'turn/started', params: { threadId: 't1', turn: { id: 'second', status: 'inProgress' } } });
+  expect(footer('second')).toBe('Codex · model-b · low · Working');
+  await bridge.notification({ method: 'model/rerouted', params: { threadId: 't1', turnId: 'first', fromModel: 'model-a', toModel: 'model-c' } });
+  expect(footer('first')).toBe('Codex · model-c · Working');
+  expect(footer('second')).toBe('Codex · model-b · low · Working');
+  await bridge.notification({ method: 'turn/completed', params: { threadId: 't1', turn: { id: 'first', status: 'completed' } } });
+  expect(footer('first')).toBe('Codex · model-c · Complete');
+  expect(store.turnState('t1', 'first')!.model).toEqual({ name: 'model-c', source: 'rerouted', effort: null });
+});
+
+test('unfinished and moderated text never leaks from active snapshots or empty completion notifications', async () => {
+  const { bridge, codex, chat, store } = fixture();
+  codex.turns = [{ id: 'live', status: 'inProgress', items: [
+    { id: 'raw', type: 'reasoning', text: 'private reasoning' },
+    { id: 'answer', type: 'agentMessage', text: 'unfinished text' },
+  ] }];
+  await bridge.sync(); await bridge.flush();
+  expect(chat.sent[0]!.delivery.content).toBe('Working…');
+  await bridge.notification({ method: 'turn/completed', params: { threadId: 't1', turn: { id: 'live', status: 'completed' } } });
+  await bridge.notification({ method: 'item/completed', params: { threadId: 't1', turnId: 'live', item: {
+    id: 'answer', type: 'agentMessage', text: 'blocked text', moderation: { moderated: true },
+  } } });
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  expect(chat.edits.at(-1)!.delivery.content).toBe('Turn complete.');
+  // A late authoritative answer repairs an empty final card without reopening it.
+  await bridge.notification({ method: 'item/completed', params: { threadId: 't1', turnId: 'live', item: {
+    id: 'late', type: 'agentMessage', text: 'Final safe answer.', phase: null,
+  } } });
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  expect(chat.edits.at(-1)!.delivery.content).toBe('Final safe answer.');
+  expect(chat.edits.at(-1)!.delivery.card?.footer).toBe('Codex · Complete');
+  expect(chat.sent).toHaveLength(1);
+});
+
+test('progress updates preserve delivery backoff and coalesce before the retry', async () => {
+  const { bridge, chat, store } = fixture();
+  await bridge.notification({ method: 'turn/started', params: { threadId: 't1', turn: { id: 'live', status: 'inProgress' } } });
+  chat.fail = true; await bridge.flush();
+  const before = store.db.query<{ nextAttempt: number }, []>('SELECT nextAttempt FROM outbox').get()!.nextAttempt;
+  for (const command of ['first', 'second', 'latest']) await bridge.notification({ method: 'item/started', params: {
+    threadId: 't1', turnId: 'live', item: { id: command, type: 'commandExecution', command },
+  } });
+  expect(store.db.query<{ nextAttempt: number }, []>('SELECT nextAttempt FROM outbox').get()!.nextAttempt).toBe(before);
+  chat.fail = false; await bridge.flush();
+  expect(chat.sent).toHaveLength(0);
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  expect(chat.sent).toHaveLength(1);
+  expect(chat.sent[0]!.delivery.content).toBe('Running `latest`');
+});
+
+test('a final answer arriving while the progress card is being sent schedules an edit', async () => {
+  const { bridge, chat, store } = fixture();
+  await bridge.notification({ method: 'turn/started', params: { threadId: 't1', turn: { id: 'live', status: 'inProgress' } } });
+  let release!: () => void;
+  const send = chat.send.bind(chat);
+  chat.send = async (...args) => { await new Promise<void>(resolve => { release = resolve; }); return send(...args); };
+  const sending = bridge.flush();
+  await bridge.notification({ method: 'item/completed', params: { threadId: 't1', turnId: 'live', item: { id: 'a', type: 'agentMessage', text: 'Done.' } } });
+  await bridge.notification({ method: 'turn/completed', params: { threadId: 't1', turn: { id: 'live', status: 'completed' } } });
+  release(); await sending;
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  expect(chat.sent).toHaveLength(1);
+  expect(chat.edits).toHaveLength(1);
+  expect(chat.edits[0]!.id).toBe(chat.sent[0]!.id);
+  expect(chat.edits[0]!.delivery.content).toBe('Done.');
+});
+
+test('progress edits leave pending approval controls on their separate card', async () => {
+  const { bridge, chat, store } = fixture();
+  await bridge.notification({ method: 'turn/started', params: { threadId: 't1', turn: { id: 'turn1', status: 'inProgress' } } });
+  await bridge.flush();
+  await bridge.serverRequest(approval());
+  await Bun.sleep(0);
+  await bridge.notification({ method: 'item/started', params: { threadId: 't1', turnId: 'turn1', item: { id: 'cmd', type: 'commandExecution', command: 'git status' } } });
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  const prompt = chat.sent.find(m => m.delivery.buttons?.length)!;
+  expect(prompt.delivery.buttons).toHaveLength(2);
+  expect(chat.edits.find(e => e.id === prompt.id)).toBeUndefined();
+  expect(chat.edits.at(-1)!.delivery.content).toBe('Waiting for your response…');
+  await bridge.decide(store.pendingApprovals()[0]!.token, 'accept', 'c1', 'alice');
+  await bridge.notification({ method: 'serverRequest/resolved', params: { requestId: 9 } });
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  expect(chat.edits.find(e => e.id === prompt.id)?.delivery.buttons).toEqual([]);
+  expect(chat.edits.filter(e => e.id !== prompt.id).at(-1)!.delivery.content).toBe('Running `git status`');
+});
+
+test('subagents have independent turn cards and terminal failure states survive late events', async () => {
+  const { bridge, chat, store } = fixture();
+  store.saveBinding({ ...binding, threadId: 'child', parentThreadId: 't1', label: 'Reviewer' });
+  for (const threadId of ['t1', 'child']) await bridge.notification({ method: 'turn/started', params: {
+    threadId, turn: { id: 'same-id', status: 'inProgress' },
+  } });
+  await bridge.flush();
+  expect(chat.sent).toHaveLength(2);
+  await bridge.notification({ method: 'turn/completed', params: { threadId: 'child', turn: { id: 'same-id', status: 'failed', error: { message: 'Connection lost' } } } });
+  await bridge.notification({ method: 'turn/completed', params: { threadId: 't1', turn: { id: 'same-id', status: 'interrupted' } } });
+  await bridge.notification({ method: 'turn/started', params: { threadId: 'child', turn: { id: 'same-id', status: 'inProgress' } } });
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  expect(chat.edits.find(e => e.delivery.card?.footer === 'Reviewer · Failed')?.delivery.content).toContain('Connection lost');
+  expect(chat.edits.find(e => e.delivery.card?.footer === 'Codex · Interrupted')).toBeDefined();
+  expect(chat.sent).toHaveLength(2);
 });

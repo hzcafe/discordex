@@ -8,7 +8,7 @@ import type { Bridge } from './bridge.js';
 import { card, compact, deliveryNonce } from './render.js';
 import { discordPayload, discordEditPayload } from './components.js';
 import { Store } from './store.js';
-import type { ChatPort, Delivery, Packet, Thread, Verbosity } from './types.js';
+import type { ChatPort, Delivery, Packet, Thread } from './types.js';
 
 export class DiscordAdapter implements ChatPort {
   readonly client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -54,9 +54,7 @@ export class DiscordAdapter implements ChatPort {
       .addSubcommand(c => c.setName('attach').setDescription('Link an existing Codex session').addStringOption(o => o.setName('id').setDescription('Codex thread ID').setRequired(true)))
       .addSubcommand(c => c.setName('steer').setDescription('Send instructions into the active turn now').addStringOption(o => o.setName('message').setDescription('Instructions for Codex').setRequired(true)))
       .addSubcommand(c => c.setName('stop').setDescription('Interrupt the active turn'))
-      .addSubcommand(c => c.setName('status').setDescription('Show bridge status'))
-      .addSubcommand(c => c.setName('verbosity').setDescription('Choose which updates appear here').addStringOption(o => o.setName('level').setDescription('Output detail').setRequired(true).addChoices(
-        { name: 'Quiet: final output and prompts', value: 'quiet' }, { name: 'Progress: add commentary', value: 'progress' }, { name: 'Verbose: add tools and diffs', value: 'verbose' })));
+      .addSubcommand(c => c.setName('status').setDescription('Show bridge status'));
     // Upsert our command by name; do not overwrite other commands on the application.
     await channel.guild.commands.create(command);
   }
@@ -157,9 +155,6 @@ export class DiscordAdapter implements ChatPort {
             const binding = await bridge.attach(interaction.options.getString('id', true)); result = `Connected: <#${binding.channelId}>`;
           } else if (sub === 'steer' || sub === 'stop') {
             await bridge.control(channelId, sub, interaction.options.getString('message') ?? undefined, interaction.user.id, interaction.user.username, interaction.id);
-          } else if (sub === 'verbosity') {
-            if (!this.store.byChannel(channelId)) throw new Error('Choose verbosity inside a linked thread');
-            bridge.verbosity(channelId, interaction.options.getString('level', true) as Verbosity);
           } else result = `Codex: ${bridge.codex.connected ? 'connected' : 'reconnecting'}\nLinked agents: ${this.store.bindings().length}\nPending prompts: ${this.store.pendingApprovals().length}`;
         });
       } else {
