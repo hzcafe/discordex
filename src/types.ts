@@ -63,6 +63,23 @@ export interface TokenUsageSnapshot {
   total: { totalTokens: number; inputTokens: number; outputTokens: number };
   reportedAt: number;
 }
+export type GoalStatus = 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
+export interface ThreadGoal {
+  threadId: string;
+  objective: string;
+  status: GoalStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
+export interface GoalCardState {
+  goal: ThreadGoal | null;
+  version: string;
+  epoch: string;
+  unavailable?: string;
+}
 export interface Binding {
   threadId: string;
   parentThreadId: string | null;

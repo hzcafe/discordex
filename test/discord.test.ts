@@ -5,7 +5,73 @@ import { DiscordAdapter } from '../src/discord.js';
 import { Bridge } from '../src/bridge.js';
 import { Store } from '../src/store.js';
 import type { Config } from '../src/config.js';
-import type { Binding, CodexPort } from '../src/types.js';
+import type { Binding, CodexPort, Delivery, ThreadGoal } from '../src/types.js';
+
+test('goal slash command, create modal, budget modal, and clear button operate one shared card with private acknowledgments', async () => {
+  const store = new Store(':memory:');
+  const config: Config = { guildId: 'guild', channelId: 'parent', allowedUserIds: ['alice'], approverUserIds: ['alice'],
+    autoDiscover: false, projectRoots: [], socketPath: '/unused', stateDir: '/unused' };
+  store.saveBinding({ threadId: 't1', channelId: 'thread', parentThreadId: null, cwd: '/work', label: 'Project', since: 0, initialTurnId: null, checkpoint: null });
+  let goal: ThreadGoal | null = null;
+  const mutations: any[] = [];
+  const codex = Object.assign(new EventEmitter(), { connected: true, epoch: 'one', request: async (method: string, params: any) => {
+    if (method === 'thread/goal/get') return { goal: structuredClone(goal) };
+    mutations.push({ method, params });
+    if (method === 'thread/goal/clear') { goal = null; return { cleared: true }; }
+    if (method !== 'thread/goal/set') throw new Error(`Unexpected method ${method}`);
+    goal = { threadId: 't1', objective: '', status: 'active', tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAt: 1, updatedAt: 1,
+      ...(goal ?? {}), ...params };
+    return { goal: structuredClone(goal) };
+  }, respond: async () => {} }) as CodexPort;
+  const adapter = new DiscordAdapter(config, store);
+  const sent: Delivery[] = []; const edits: { id: string; delivery: Delivery }[] = [];
+  const chat = { createThread: async () => 'thread', send: async (_channel: string, delivery: Delivery) => { sent.push(delivery); return 'goal-message'; },
+    edit: async (_channel: string, id: string, delivery: Delivery) => { edits.push({ id, delivery }); } };
+  const bridge = new Bridge(config, codex, store, chat, () => {});
+  (adapter as any).bridge = bridge;
+  const interaction = (kind: 'command' | 'button' | 'modal', customId = '', values: Record<string, string> = {}) => {
+    const responses: { deferred?: any; edited?: any; modal?: any; reply?: any } = {};
+    const event = { isChatInputCommand: () => kind === 'command', isButton: () => kind === 'button', isModalSubmit: () => kind === 'modal',
+      commandName: 'codex', guildId: 'guild', channelId: 'thread', user: { id: 'alice' }, customId,
+      options: { getSubcommand: () => 'goal' }, fields: { getTextInputValue: (key: string) => values[key] },
+      deferred: false, replied: false,
+      deferReply: async (payload: any) => { event.deferred = true; responses.deferred = payload; },
+      editReply: async (payload: any) => { responses.edited = payload; },
+      showModal: async (modal: any) => { event.replied = true; responses.modal = modal.toJSON(); },
+      reply: async (payload: any) => { responses.reply = payload; },
+    };
+    return { event, responses };
+  };
+  const control = (action: string) => `dx:goal:t1:${store.goalCard('t1')!.version}:${action}`;
+  try {
+    const command = interaction('command'); await (adapter as any).interact(command.event);
+    expect(command.responses.deferred.flags).toBe(MessageFlags.Ephemeral);
+    expect(sent).toHaveLength(1); expect(mutations).toHaveLength(0);
+    expect(JSON.stringify(command.responses.edited)).toContain('https://discord.com/channels/guild/thread/goal-message');
+    const createId = control('create');
+    const button = interaction('button', createId); await (adapter as any).interact(button.event);
+    expect(button.responses.deferred).toBeUndefined();
+    expect(button.responses.modal.custom_id).toBe(createId);
+    expect(button.responses.modal.components).toHaveLength(2);
+    expect(mutations).toHaveLength(0);
+    const submit = interaction('modal', createId, { objective: 'Ship it', budget: '10000' });
+    await (adapter as any).interact(submit.event);
+    expect(submit.responses.deferred.flags).toBe(MessageFlags.Ephemeral);
+    expect(mutations[0]).toEqual({ method: 'thread/goal/set', params: { threadId: 't1', origin: 'user', objective: 'Ship it', tokenBudget: 10000, status: 'active' } });
+    const budgetId = control('budget');
+    const edit = interaction('button', budgetId); await (adapter as any).interact(edit.event);
+    expect(edit.responses.modal.components).toHaveLength(1);
+    expect(edit.responses.modal.components[0].components[0].value).toBe('10000');
+    const removeBudget = interaction('modal', budgetId, { budget: '' }); await (adapter as any).interact(removeBudget.event);
+    expect(mutations.at(-1).params).toEqual({ threadId: 't1', origin: 'user', tokenBudget: null });
+    const clear = interaction('button', control('clear')); await (adapter as any).interact(clear.event);
+    expect(mutations.at(-1)).toEqual({ method: 'thread/goal/clear', params: { threadId: 't1', origin: 'user' } });
+    store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+    expect(sent).toHaveLength(1);
+    expect(edits.at(-1)!.id).toBe('goal-message');
+    expect(edits.at(-1)!.delivery.content).toContain('No goal set');
+  } finally { await adapter.close(); await bridge.stop(); store.close(); }
+});
 
 test('usage is an ephemeral Components V2 card and an account read never occupies the bridge work queue', async () => {
   const store = new Store(':memory:');

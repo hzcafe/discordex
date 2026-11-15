@@ -5,6 +5,7 @@ import { Store } from './store.js';
 import { approvalDelivery, deliveryNonce, message, sessionCard } from './render.js';
 import { TurnCards } from './turns.js';
 import { tokenUsageSnapshot, usageCard } from './usage.js';
+import { Goals, type GoalAction, type GoalInput } from './goals.js';
 import type { AccountRateLimits, Binding, ChatPort, CodexPort, Delivery, Packet, Thread, Turn } from './types.js';
 
 export class Bridge {
@@ -16,9 +17,12 @@ export class Bridge {
   private stopped = false;
   private listeners: { event: string; listener: (...args: any[]) => void }[] = [];
   private turns: TurnCards;
+  private goals: Goals;
 
   constructor(readonly config: Config, readonly codex: CodexPort, readonly store: Store,
-    private chat: ChatPort, private log: (text: string) => void = console.error) { this.turns = new TurnCards(store); }
+    private chat: ChatPort, private log: (text: string) => void = console.error) {
+    this.turns = new TurnCards(store); this.goals = new Goals(store, codex);
+  }
 
   // Codex notifications and human submissions share one ordering boundary.
   serial<T>(work: () => Promise<T>): Promise<T> {
@@ -28,9 +32,10 @@ export class Bridge {
   }
   start(): void {
     this.expireApprovals();
+    this.invalidateGoals();
     for (const input of this.store.inputs()) if (input.state === 'submitting') this.store.inputState(input.id, 'unknown');
     this.listen('ready', () => { void this.serial(() => this.sync()); });
-    this.listen('disconnected', () => { this.subscribed.clear(); this.expireApprovals(); });
+    this.listen('disconnected', () => { this.subscribed.clear(); this.expireApprovals(); this.invalidateGoals(); });
     this.listen('notification', (packet: Packet) => {
       const epoch = this.codex.epoch;
       void this.serial(() => epoch === this.codex.epoch ? this.notification(packet) : Promise.resolve());
@@ -58,6 +63,26 @@ export class Bridge {
       const path = relative(root, thread.cwd);
       return path === '' || (path !== '..' && !path.startsWith('../') && !isAbsolute(path));
     });
+  }
+  private invalidateGoals(): void {
+    for (const binding of this.store.bindings()) {
+      if (!binding.parentThreadId && this.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) this.goals.unavailable(binding);
+    }
+  }
+  private goalBinding(channelId: string, userId: string, threadId?: string): Binding {
+    if (!this.config.allowedUserIds.includes(userId)) throw new Error('You are not configured to control Codex');
+    const binding = this.requireBinding(channelId);
+    if (threadId && threadId !== binding.threadId) throw new Error('This goal control belongs to a different session');
+    return binding;
+  }
+  async showGoal(channelId: string, userId: string): Promise<void> {
+    await this.goals.read(this.goalBinding(channelId, userId), true);
+  }
+  goalForm(channelId: string, userId: string, threadId: string, version: string, action: 'create' | 'budget') {
+    return this.goals.form(this.goalBinding(channelId, userId, threadId), version, action);
+  }
+  async goalAction(channelId: string, userId: string, threadId: string, version: string, action: GoalAction, input?: GoalInput): Promise<string> {
+    return this.goals.act(this.goalBinding(channelId, userId, threadId), version, action, input);
   }
   async usage(channelId: string, userId: string): Promise<Delivery> {
     if (!this.config.allowedUserIds.includes(userId)) throw new Error('You are not configured to control this bot');
@@ -143,6 +168,10 @@ export class Bridge {
         await this.reconcile(binding);
         if (!binding.parentThreadId) await this.drainInputs(binding);
       } catch (error) { this.log(`Sync ${binding.threadId}: ${error}`); }
+      if (!binding.parentThreadId) {
+        try { await this.goals.read(binding); }
+        catch (error) { this.log(`Goal sync ${binding.threadId}: ${error}`); }
+      }
     }
     void this.flush();
   }
@@ -196,7 +225,11 @@ export class Bridge {
     }
     const binding = this.store.binding(p.threadId);
     if (!binding || !this.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) return;
-    if (packet.method === 'thread/tokenUsage/updated') {
+    if (packet.method === 'thread/goal/updated' || packet.method === 'thread/goal/cleared') {
+      // Read the authoritative snapshot: delayed notifications must not restore
+      // a replaced goal or clear a newer one created in another client.
+      if (!binding.parentThreadId) await this.goals.read(binding);
+    } else if (packet.method === 'thread/tokenUsage/updated') {
       const usage = tokenUsageSnapshot(p.tokenUsage);
       if (usage) this.store.saveTokenUsage(binding.threadId, usage);
     } else if (packet.method === 'item/started' || packet.method === 'item/completed') {

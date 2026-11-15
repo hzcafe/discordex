@@ -33,6 +33,10 @@ The two allowlists control actions:
 
 Contributors can run `/codex usage` in the configured channel or an eligible linked thread. Its response is visible only to the person who ran it. The allowance is for the host's Codex account, shared across sessions; Discord users do not get separate quotas. The command reads usage and cannot buy credits, consume resets, or change account settings.
 
+Contributors can also use `/codex goal` and its controls in an eligible linked thread. The goal card is shared with everyone who can read that thread; command acknowledgments are private. Goal controls do not grant tool-approval permissions. Creating or resuming a goal can start work immediately. Pausing or clearing stops goal-driven continuation, while `/codex stop` interrupts the current turn.
+
+Goal budgets are positive whole token counts. **Edit budget** sets the total budget, preserving the objective and usage history; leave it blank to remove the explicit budget (host policy limits still apply). After increasing an exhausted budget, choose **Resume**. Completed goals offer **New goal**, which starts new usage accounting. If another client changes the goal while a modal is open, refresh the card and reopen the form.
+
 Discord channel membership controls **read access**. The bot's allowlists do not change channel visibility. Choose the server and channel membership to match who should see the exported conversations.
 
 Output, commands, and diffs are sent to Discord and stored locally for delivery. Self-hosting the bridge does not keep exported content off Discord. Keep `.env` and `discordex.config.json` out of version control; both are gitignored.
@@ -79,6 +83,8 @@ If it must keep running after your last login session ends, enable user lingerin
 | An old conversation is missing | First attachment exports the active turn and future work; it does not import the whole prior conversation. |
 | Usage says account limits are unavailable | Check daemon connectivity and whether the account's authentication supports the rate-limit endpoint. Rerun `/codex usage` after reconnecting. |
 | Session token counts are missing or old | Counters update when Codex emits a usage notification. The card shows the last reported snapshot, including after a restart; it does not infer missing usage from transcript length. |
+| A goal button is out of date | Use **Refresh** or `/codex goal`. Reconnects, goal replacement, status changes, and budget changes invalidate older controls and open forms. |
+| A goal action could not be confirmed | Refresh to read the daemon's current goal before retrying. The bot does not automatically replay an uncertain mutation. |
 
 An inbox reaction means Discordex recorded the message, not that Codex has started or completed the work. An uncertain-submission warning means the daemon connection failed around submission; check the session before resending.
 

@@ -29,6 +29,7 @@ class FakeCodex extends EventEmitter implements CodexPort {
     this.calls.push({ method, params });
     let result: any;
     if (method === 'thread/read') result = { thread: structuredClone(this.thread) };
+    else if (method === 'thread/goal/get') result = { goal: null };
     else if (method === 'account/rateLimits/read') result = this.rateLimits;
     else if (method === 'thread/resume') result = { thread: this.thread };
     else if (method === 'thread/loaded/list') result = { data: [this.thread.id] };

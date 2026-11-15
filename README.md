@@ -36,6 +36,7 @@ Built with **Bun, TypeScript, and SQLite**, the bridge consumes structured Codex
 | **Coding agents on your phone** | Send work, steer an active turn, or stop it from Discord while Codex runs on your dev box. |
 | **A thread for every session** | Discover loaded Codex sessions within your project roots. Subagents join their parent's Discord thread with distinct labels. |
 | **Live progress without the flood** | One compact message per agent turn, edited as work progresses and finalized with the response. Model and effort appear in the footer when available. |
+| **Goals you can manage together** | A shared goal card shows the objective, status, elapsed time, and token budget, with controls to create, pause, resume, change the budget, or clear it. |
 | **Approvals where you are** | Buttons for command, file-change, and permission requests; modals for supported input questions. |
 | **Work with friends** | Attributed messages let contributors share a conversation. Separate allowlists decide who can send instructions and who can approve actions. |
 | **Reconnect and carry on** | SQLite persists thread mappings, message delivery, and approval state so the bridge can recover after a disconnect. |
@@ -121,11 +122,14 @@ For an always-on installation, use the [Linux background-service guide](docs/con
 | Interrupt the current turn | `/codex stop` |
 | Inspect connectivity | `/codex status` |
 | View remaining allowance and token usage | `/codex usage` |
+| View and manage the session's goal | `/codex goal` in a linked thread |
 | Answer an approval or question | Use the buttons or modal on its prompt card |
 
 Every allowed user's text in a linked thread reaches Codex, including discussion between friends. Messages in the index channel stay there; bot and webhook messages are ignored.
 
 `/codex usage` replies privately with a compact card: a progress bar and percentage remaining for each reported allowance window, plus its reset time in your Discord locale. These limits belong to the host's Codex account and are shared across sessions. In a linked thread, the card also shows the main agent's last reported session token counts. Run the command again for a fresh account snapshot; missing data is shown as unavailable, never as zero.
+
+`/codex goal` opens one **shared goal card** for the linked conversation. It updates in place when the goal changes in Discord or your local Codex client. Use **Create goal** to enter an objective and optional token budget, **Pause/Resume** to control goal-driven continuation, **Edit budget** to change the total budget, and **Clear** to remove the goal. A completed goal offers **New goal**. Creating or resuming can start work immediately; pausing or clearing does not forcibly interrupt a current turn—use `/codex stop` for that. The goal's emoji budget bar is separate from account allowance.
 
 Each agent turn gets **one message that keeps updating**: working, running a command, editing files, completed commentary, then the final response. Longer final answers include the full text as a file attachment. Approval prompts have separate cards so progress updates never hide a pending decision. Partial token streams and private reasoning text are not exported.
 

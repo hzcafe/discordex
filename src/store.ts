@@ -1,7 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Binding, Delivery, Item, Packet, TokenUsageSnapshot, TurnState } from './types.js';
+import type { Binding, Delivery, GoalCardState, Item, Packet, TokenUsageSnapshot, TurnState } from './types.js';
 
 export interface Outgoing { key: string; channel: string; payload: string; message: string | null; attempts: number; revision: number }
 export interface Approval { token: string; epoch: string; rpcId: string; threadId: string; channel: string; packet: string; state: string }
@@ -43,6 +43,19 @@ export class Store {
     return value ? JSON.parse(value) : null;
   }
   saveTokenUsage(threadId: string, usage: TokenUsageSnapshot): void { this.setMeta(`token-usage:${threadId}`, JSON.stringify(usage)); }
+  goalCard(threadId: string): GoalCardState | null {
+    const value = this.getMeta(`goal-card:${threadId}`);
+    return value ? JSON.parse(value) : null;
+  }
+  messageId(key: string): string | null {
+    return this.db.query<{ message: string | null }, [string]>('SELECT message FROM outbox WHERE key = ?').get(key)?.message ?? null;
+  }
+  publishGoal(binding: Binding, state: GoalCardState, delivery: Delivery): void {
+    this.db.transaction(() => {
+      this.setMeta(`goal-card:${binding.threadId}`, JSON.stringify(state));
+      this.publishLatest(`goal:${binding.threadId}`, binding.channelId, delivery);
+    })();
+  }
   claim(context: string): void {
     this.db.transaction(() => {
       const previous = this.getMeta('context');
@@ -80,7 +93,7 @@ export class Store {
   delivered(row: Outgoing, message: string): void {
     // A resolution may revise an approval while Discord's send is in flight.
     this.db.query('UPDATE outbox SET message = ?, pending = CASE WHEN revision = ? THEN 0 ELSE 1 END, attempts = 0, nextAttempt = ? WHERE key = ?')
-      .run(message, row.revision, row.key.startsWith('turn:') ? Date.now() + 1000 : 0, row.key);
+      .run(message, row.revision, /^(turn|goal):/.test(row.key) ? Date.now() + 1000 : 0, row.key);
   }
   retry(row: Outgoing): void {
     this.db.query('UPDATE outbox SET attempts = attempts + 1, nextAttempt = ? WHERE key = ?').run(Date.now() + Math.min(300_000, 1000 * 2 ** Math.min(row.attempts, 8)), row.key);
@@ -123,12 +136,15 @@ export class Store {
   publishTurn(binding: Binding, state: TurnState, delivery: Delivery): void {
     this.db.transaction(() => {
       this.db.query('INSERT OR REPLACE INTO turn_cards VALUES (?, ?, ?)').run(binding.threadId, state.turn.id, JSON.stringify(state));
-      // Coalesce edits without resetting rate-limit cooldowns or failure backoff.
-      this.db.query(`INSERT INTO outbox (key, channel, payload) VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, pending = 1, revision = outbox.revision + 1
-        WHERE outbox.payload != excluded.payload`)
-        .run(`turn:${binding.threadId}:${state.turn.id}`, binding.channelId, JSON.stringify(delivery));
+      this.publishLatest(`turn:${binding.threadId}:${state.turn.id}`, binding.channelId, delivery);
     })();
+  }
+  private publishLatest(key: string, channelId: string, delivery: Delivery): void {
+    // Coalesce edits without resetting rate-limit cooldowns or failure backoff.
+    this.db.query(`INSERT INTO outbox (key, channel, payload) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET payload = excluded.payload, pending = 1, revision = outbox.revision + 1
+      WHERE outbox.payload != excluded.payload`)
+      .run(key, channelId, JSON.stringify(delivery));
   }
   close(): void { this.db.close(); }
 }

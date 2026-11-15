@@ -7,6 +7,7 @@ import type { Config } from './config.js';
 import type { Bridge } from './bridge.js';
 import { card, compact, deliveryNonce } from './render.js';
 import { discordPayload, discordEditPayload } from './components.js';
+import { parseGoalControl } from './goals.js';
 import { Store } from './store.js';
 import type { ChatPort, Delivery, Packet, Thread } from './types.js';
 
@@ -55,6 +56,7 @@ export class DiscordAdapter implements ChatPort {
       .addSubcommand(c => c.setName('steer').setDescription('Send instructions into the active turn now').addStringOption(o => o.setName('message').setDescription('Instructions for Codex').setRequired(true)))
       .addSubcommand(c => c.setName('stop').setDescription('Interrupt the active turn'))
       .addSubcommand(c => c.setName('usage').setDescription('Show remaining account allowance and session token usage'))
+      .addSubcommand(c => c.setName('goal').setDescription('Show and manage this session’s shared goal card'))
       .addSubcommand(c => c.setName('status').setDescription('Show bridge status'));
     // Upsert our command by name; do not overwrite other commands on the application.
     await channel.guild.commands.create(command);
@@ -128,6 +130,9 @@ export class DiscordAdapter implements ChatPort {
       await interaction.reply({ content: 'Use the configured Codex channel or a linked thread.', flags: MessageFlags.Ephemeral }); return;
     }
     try {
+      if (interaction.isChatInputCommand() ? interaction.options.getSubcommand() === 'goal' : interaction.customId.startsWith('dx:goal:')) {
+        await this.interactGoal(interaction); return;
+      }
       if (interaction.isButton() && interaction.customId.endsWith(':answer')) {
         if (!this.config.approverUserIds.includes(interaction.user.id)) throw new Error('You are not configured as an approver');
         const token = interaction.customId.split(':')[1]!;
@@ -179,6 +184,47 @@ export class DiscordAdapter implements ChatPort {
       if (interaction.deferred || interaction.replied) await interaction.editReply(discordEditPayload(card(content, { title: 'Unable to complete that action', tone: 'warning' })));
       else await interaction.reply({ content, flags: MessageFlags.Ephemeral });
     }
+  }
+  private async interactGoal(interaction: Interaction): Promise<void> {
+    if (!interaction.isChatInputCommand() && !interaction.isButton() && !interaction.isModalSubmit()) return;
+    const bridge = this.bridge!;
+    const channelId = interaction.channelId!;
+    const control = interaction.isChatInputCommand() ? null : parseGoalControl(interaction.customId);
+    if (interaction.isButton() && control && (control.action === 'create' || control.action === 'budget')) {
+      // Opening a modal must be the initial response. Cached validation is fast;
+      // submission checks the current daemon state again before any mutation.
+      const state = bridge.goalForm(channelId, interaction.user.id, control.threadId, control.version, control.action);
+      const modal = new ModalBuilder().setCustomId(interaction.customId)
+        .setTitle(control.action === 'create' ? 'Create Codex goal' : 'Edit goal budget');
+      if (control.action === 'create') modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder().setCustomId('objective').setLabel('Objective (starts work immediately)')
+          .setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000)));
+      const budget = new TextInputBuilder().setCustomId('budget').setLabel('Total token budget (optional)')
+        .setPlaceholder('Blank removes the explicit budget; host limits still apply')
+        .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(16);
+      if (control.action === 'budget' && state.goal?.tokenBudget !== null && state.goal?.tokenBudget !== undefined) budget.setValue(String(state.goal.tokenBudget));
+      modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(budget));
+      await interaction.showModal(modal); return;
+    }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    let result = 'Goal card updated.';
+    await bridge.serial(async () => {
+      if (!control) await bridge.showGoal(channelId, interaction.user.id);
+      else {
+        const input: { objective?: string; budget?: string } = {};
+        if (interaction.isModalSubmit()) {
+          if (control.action !== 'create' && control.action !== 'budget') throw new Error('Unknown goal form');
+          input.budget = interaction.fields.getTextInputValue('budget');
+          if (control.action === 'create') input.objective = interaction.fields.getTextInputValue('objective');
+        }
+        result = await bridge.goalAction(channelId, interaction.user.id, control.threadId, control.version, control.action, input);
+      }
+    });
+    await bridge.flush();
+    const binding = this.store.byChannel(channelId)!;
+    const messageId = this.store.messageId(`goal:${binding.threadId}`);
+    result += messageId ? ` [Open goal card](https://discord.com/channels/${this.config.guildId}/${channelId}/${messageId}).` : ' The shared card will appear in this thread.';
+    await interaction.editReply(discordEditPayload(card(result, { title: 'Codex goal', tone: 'info', compact: true, hideHeader: true })));
   }
   async createThread(thread: Thread): Promise<string> {
     if (!this.parent) throw new Error('Discord is not ready');

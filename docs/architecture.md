@@ -66,6 +66,16 @@ Reconnects invalidate old approval controls. Only requests replayed by Codex rec
 
 State and transcripts remain on disk. Automatic pruning is not implemented, and deleting the state directory resets mappings and delivery history.
 
+## Shared goal cards
+
+`/codex goal` manages the same persisted top-level session goal as the local Codex `/goal` interface. The bot reads `thread/goal/get`, writes `thread/goal/set`, and removes goals with `thread/goal/clear`. Explicit button and modal actions include `origin: "user"`; observing or rendering goal events never changes goal state.
+
+Existing goals appear during session reconciliation. Empty sessions get a card only when requested. `thread/goal/updated` and `thread/goal/cleared` events trigger an authoritative read, so delayed events cannot restore an old objective or clear a newer goal. The regular 15-second sync also recovers missed updates. Goal snapshots and a stable `goal:<threadId>` outbox key preserve the shared message across restarts. Edits coalesce with the same cooldown and retry behavior as turn cards. Goal budgets and counters are taken from the daemon, independently of account rate limits.
+
+Controls are scoped to the configured contributor, project, Discord thread, connection epoch, and a version of the goal's objective/status/budget. Progress counters can update without invalidating controls; reconnects and goal edits invalidate old buttons and modals. Every mutation rereads the goal before validating its control version. The protocol has no atomic compare-and-set operation, so these checks cannot make simultaneous writes from separate clients atomic.
+
+Budget edits omit the objective and status to preserve usage accounting. Creating or resuming an active goal lets Codex handle continuation directly; the bridge does not inject an extra prompt or start a duplicate turn. Pausing or clearing does not forcibly interrupt an active turn. An uncertain mutation is never retried automatically: controls are temporarily removed until an authoritative read reconciles the result. Unsupported or unavailable goal reads leave a refreshable status instead of usable stale controls.
+
 ## Source map
 
 | File | Responsibility |
@@ -79,6 +89,7 @@ State and transcripts remain on disk. Automatic pruning is not implemented, and 
 | [`src/render.ts`](../src/render.ts) | Logical output and prompt rendering |
 | [`src/components.ts`](../src/components.ts) | Compact Components V2 cards, footers, attachments, and controls |
 | [`src/usage.ts`](../src/usage.ts) | Remaining-allowance bars, quota windows, and reported session counters |
+| [`src/goals.ts`](../src/goals.ts) | Shared goal cards, input validation, control versions, and goal RPCs |
 | [`src/store.ts`](../src/store.ts) | SQLite mappings, inbox, outbox, approvals, and turn-card state |
 | [`src/types.ts`](../src/types.ts) | The supported subset of the Codex protocol |
 
