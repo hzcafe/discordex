@@ -1,131 +1,178 @@
-# Discordex
+<p align="center">
+  <img src="docs/assets/discordex-banner.svg" alt="Discordex: manage local Codex agents from Discord, with a thread per session and live progress cards. Illustrated interface." width="1280" />
+</p>
 
-A self-hosted Discord client for the **shared local Codex daemon**. Follow sessions from your phone, send instructions with friends, and answer approval prompts in Discord while the local Codex TUI stays connected.
+<h1 align="center">Discordex · OpenAI Codex in Discord</h1>
 
-Runs on **Bun**. The bridge reads structured app-server events over Codex's Unix WebSocket socket; delivery does not depend on model tool calls, terminal scraping, or shell injection.
+<p align="center">
+  <strong>Your dev box does the work. Your Discord keeps you in the loop.</strong><br />
+  A self-hosted Discord bot for managing local Codex agents from your phone, with your friends.
+</p>
 
-## Current functionality
+<p align="center">
+  <a href="#quick-start"><strong>Quick start</strong></a> ·
+  <a href="docs/architecture.md"><strong>Architecture</strong></a> ·
+  <a href="docs/configuration.md"><strong>Configuration</strong></a> ·
+  <a href="https://github.com/hzcafe/discordex/issues">Report a bug / request a feature</a>
+</p>
 
-- Discover loaded sessions within configured project roots and create one Discord thread per top-level conversation. Subagents share their parent's Discord thread, with their own labels.
-- Keep one compact Discord Components V2 card per agent turn. It updates with commentary and current activity, then becomes the final response with a small agent/status footer. Subagent cards carry their own name. Long final output is attached in full through a file component.
-- Queue ordinary Discord messages with the sender's identity. Explicit commands steer or interrupt the current turn.
-- Answer command, file-change, and permission approvals with buttons; answer user-input questions with a modal. Decisions are one-time or turn-scoped, never permanent policy changes.
-- Persist mappings, incoming messages, outgoing messages, and approval state using `bun:sqlite`. Recover missed Codex output and Discord messages after reconnecting.
-- Keep contributor and approver allowlists separate. Only configured users can send instructions or act on prompts.
+<p align="center">
+  <a href="https://github.com/hzcafe/discordex/actions/workflows/ci.yml"><img src="https://github.com/hzcafe/discordex/actions/workflows/ci.yml/badge.svg?branch=master" alt="Build, typecheck, and tests" /></a>
+  <a href="https://bun.sh"><img src="https://img.shields.io/badge/runtime-Bun-f9f1e1?labelColor=2b2d31&amp;logo=bun&amp;logoColor=white" alt="Built with Bun" /></a>
+  <a href="https://www.typescriptlang.org"><img src="https://img.shields.io/badge/language-TypeScript-5865f2?labelColor=2b2d31&amp;logo=typescript&amp;logoColor=white" alt="Written in TypeScript" /></a>
+  <a href="#quick-start"><img src="https://img.shields.io/badge/deployment-self--hosted-57f287?labelColor=2b2d31" alt="Self-hosted on your development machine" /></a>
+</p>
 
-This first version is the host service. Codex plugin installation/management packaging is still to come.
+Discordex connects **Discord to the shared local OpenAI Codex daemon**, so you can follow coding sessions, send instructions, and handle tool approvals wherever you use Discord. Keep your local Codex terminal open, pick up a conversation on mobile, or invite friends to work with the same agent.
 
-## Requirements
+Built with **Bun, TypeScript, and SQLite**, the bridge consumes structured Codex app-server events and delivers updates automatically. No SSH from your phone, terminal scraping, or model-triggered messaging tools are needed.
 
-- Bun 1.3 or newer; developed and tested with **Bun 1.4.4**.
-- **Codex 0.169.0** with its shared app-server daemon. The adapter targets this version's experimental protocol; older releases are not assumed compatible.
-- A Discord application with a bot, a server, and a text channel the bot can access.
+> **Early release:** the host service works today. Codex plugin installation and management packaging are still to come. The adapter targets the experimental daemon protocol in **Codex 0.169.0**.
 
-Discordex connects outbound to Discord's Gateway. No public HTTP listener or inbound port forwarding is needed. Codex access stays on the local Unix socket.
+## Why Discordex?
 
-## Set up
+| Feature | What you get |
+| --- | --- |
+| **Coding agents on your phone** | Send work, steer an active turn, or stop it from Discord while Codex runs on your dev box. |
+| **A thread for every session** | Discover loaded Codex sessions within your project roots. Subagents join their parent's Discord thread with distinct labels. |
+| **Live progress without the flood** | One compact message per agent turn, edited as work progresses and finalized with the response. Model and effort appear in the footer when available. |
+| **Approvals where you are** | Buttons for command, file-change, and permission requests; modals for supported input questions. |
+| **Work with friends** | Attributed messages let contributors share a conversation. Separate allowlists decide who can send instructions and who can approve actions. |
+| **Reconnect and carry on** | SQLite persists thread mappings, message delivery, and approval state so the bridge can recover after a disconnect. |
 
-1. Create an application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable **Message Content Intent** on the bot's settings page.
-2. Invite the application to your server using the `bot` and `applications.commands` scopes. Give it **View Channel**, **Send Messages**, **Create Public Threads**, **Send Messages in Threads**, **Read Message History**, **Attach Files**, and **Add Reactions** in the chosen text channel. It does not need Administrator.
-3. Enable Discord's Developer Mode to copy your server, channel, and user IDs.
-4. Install and configure:
+## How it works
 
-   ```sh
-   bun install --frozen-lockfile
-   cp discordex.config.example.json discordex.config.json
-   cp .env.example .env
-   chmod 600 .env
-   ```
+```text
+You + friends in Discord
+          ↕  messages, progress cards, approvals
+Discordex on your dev box  ·  Bun + SQLite
+          ↕  structured events over a local Unix WebSocket
+Shared Codex daemon  ↔  your local Codex client
+```
 
-   Set `DISCORDEX_DISCORD_TOKEN` in `.env`. Put the IDs and your project's absolute path into `discordex.config.json`. Add friends to `allowedUserIds`; add only the people who may authorize actions to `approverUserIds`. Approvers must also be contributors.
+Discordex connects outbound to Discord's Gateway; it needs **no public HTTP endpoint or inbound port forwarding**. The Codex connection uses a local Unix socket. Exported conversation content goes to Discord, where your channel permissions determine who can read it.
 
-5. Start Codex and check the connection:
+Read the [architecture and delivery guarantees](docs/architecture.md) for session discovery, turn rendering, and reconnect behavior.
 
-   ```sh
-   codex app-server daemon start
-   bun run doctor
-   bun start
-   ```
+## Quick start
 
-`doctor` only connects and lists loaded session IDs; it never sends prompts or posts to Discord. `start` can start the default Codex daemon if its socket is absent. It leaves that daemon running when Discordex exits.
+### 1. Prepare your host and Discord bot
 
-The bot registers `/codex` in the configured server and discovers eligible loaded sessions. New conversations appear as threads under the configured channel. The initial attachment includes the currently active turn and future work, rather than copying older conversations into Discord.
+You need **Bun 1.3+** (developed and tested with **1.4.4**), **Codex 0.169.0** with its shared app-server daemon, and a Discord server with a text channel for the bot. Older Codex releases are not assumed compatible. A Linux user-service example is included.
 
-## Use from Discord
+- Create an application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable **Message Content Intent** on the bot settings page.
+- Invite it with the `bot` and `applications.commands` scopes and these channel permissions: **View Channel**, **Send Messages**, **Create Public Threads**, **Send Messages in Threads**, **Read Message History**, **Attach Files**, and **Add Reactions**. Administrator is not required.
+- Enable Discord's Developer Mode and copy your server, text-channel, and user IDs.
 
-Every text message from an allowed user inside a linked thread is submitted to Codex. Human discussion there is therefore visible to the agent too. Messages in the index channel are not forwarded. Bot and webhook messages are ignored.
+### 2. Install and configure
 
-| Action | How |
+```sh
+git clone https://github.com/hzcafe/discordex.git
+cd discordex
+bun install --frozen-lockfile
+cp .env.example .env
+cp discordex.config.example.json discordex.config.json
+chmod 600 .env discordex.config.json
+```
+
+Set your bot token in `.env`:
+
+```dotenv
+DISCORDEX_DISCORD_TOKEN=your-discord-bot-token
+```
+
+Edit `discordex.config.json` with your IDs and an **absolute project path**:
+
+```json
+{
+  "guildId": "YOUR_DISCORD_SERVER_ID",
+  "channelId": "YOUR_DISCORD_TEXT_CHANNEL_ID",
+  "allowedUserIds": ["YOUR_DISCORD_USER_ID"],
+  "approverUserIds": ["YOUR_DISCORD_USER_ID"],
+  "autoDiscover": true,
+  "projectRoots": ["/absolute/path/to/your/project"]
+}
+```
+
+Add friends to `allowedUserIds` to let them send instructions. Add people who may authorize actions to `approverUserIds`; every approver must also be a contributor. Keep the token in `.env`, which is gitignored.
+
+### 3. Connect Codex
+
+```sh
+codex app-server daemon start
+bun run doctor
+bun start
+```
+
+Open or keep a Codex session running in a configured project. The bot registers `/codex` in your server and creates a Discord thread for each eligible loaded conversation. **Send a message in that thread to give Codex work.** An inbox reaction confirms the message was recorded.
+
+Initial attachment includes an active turn and future work; it does not copy the entire old conversation. `doctor` checks the local daemon connection without sending prompts or posting to Discord. `start` can launch the default daemon when its socket is missing and leaves it running when Discordex exits.
+
+For an always-on installation, use the [Linux background-service guide](docs/configuration.md#run-as-a-linux-background-service).
+
+## Use Codex from Discord
+
+| Action | Command or interaction |
 | --- | --- |
 | List eligible loaded sessions | `/codex sessions` |
 | Attach a session explicitly | `/codex attach id:<Codex thread ID>` |
-| Send work for the next turn | Send a normal message in the linked thread |
+| Queue work for the next turn | Send a normal message in a linked thread |
 | Add instructions to work in progress | `/codex steer message:<instructions>` |
 | Interrupt the current turn | `/codex stop` |
 | Inspect connectivity | `/codex status` |
+| Answer an approval or question | Use the buttons or modal on its prompt card |
 
-Each turn gets one message that is edited as work progresses: working, running a command, editing files, or completed commentary. On completion, the same card contains the final response; interruptions and failures remain visible in its status. Edits are coalesced with at least one second between successful updates to a turn card, and retries preserve backoff. Completed assistant text is authoritative; partial token streams and reasoning text are not exported. There are no verbosity modes; legacy `verbosity` settings are ignored.
+Every allowed user's text in a linked thread reaches Codex, including discussion between friends. Messages in the index channel stay there; bot and webhook messages are ignored.
 
-Approval and input prompts have separate cards so progress edits cannot remove a pending decision. Reconnects recover turn state and edit the original card. Multiple agents each have their own turn card in the shared Discord thread.
+Each agent turn gets **one message that keeps updating**: working, running a command, editing files, completed commentary, then the final response. Longer final answers include the full text as a file attachment. Approval prompts have separate cards so progress updates never hide a pending decision. Partial token streams and private reasoning text are not exported.
 
-Turn footers include the model name and reasoning effort when available. The source is tracked internally: the initial values are captured session settings, not per-turn execution telemetry. A daemon-reported model reroute updates that turn's model label. Later session settings changes do not rewrite older cards, and recovered historical turns without a captured model are left unlabeled.
+## Documentation
 
-An inbox reaction means Discordex has recorded the message. It is not a claim that Codex has finished—or even started—the requested work. An uncertain-submission warning means the daemon connection failed around a submission; check the session before resending.
-
-Approve/decline buttons work only for configured approvers and only for the exact pending request. Resolution in the local TUI removes the Discord controls. Reconnects invalidate old controls; only requests replayed by Codex get fresh controls. A file approval without an available diff, a secret question, or an unsupported request type must be answered in the local client.
-
-Attachments and voice messages are not ingested in this version. Text accompanying an attachment is forwarded as text only.
-
-## Configuration
-
-`DISCORDEX_CONFIG` selects the config file; the default is `./discordex.config.json`. Bun automatically loads `.env` from the working directory. The bot token is kept out of the JSON configuration and database.
-
-| Field | Default / meaning |
+| Guide | Covers |
 | --- | --- |
-| `guildId`, `channelId` | Required Discord server and text-channel IDs |
-| `allowedUserIds` | Required nonempty list of contributors |
-| `approverUserIds` | Required nonempty list of approvers |
-| `autoDiscover` | `true`; automatically link eligible loaded sessions |
-| `projectRoots` | `[]`; all projects. Otherwise absolute roots, including their descendants |
-| `socketPath` | `$CODEX_HOME/app-server-control/app-server-control.sock`, with `CODEX_HOME` defaulting to `~/.codex` |
-| `stateDir` | `$XDG_STATE_HOME/discordex`, defaulting to `~/.local/state/discordex` |
+| [Configuration and hosting](docs/configuration.md) | Settings, contributor and approver access, Linux service, and troubleshooting |
+| [Architecture](docs/architecture.md) | Bun/TypeScript stack, daemon discovery, editable cards, persistence, and recovery limits |
+| [Development](#development) | Local checks, source map, and protocol updates |
 
-Choose channel membership to match who should be able to **read** exported output. The bot's user allowlists control who can submit or approve; they do not change Discord channel visibility. Output, commands, and diffs are sent to Discord and stored locally for delivery.
+## FAQ
 
-Use one service per host/socket and a separate state directory for a different bot channel or socket. Sessions running with `--no-daemon` or hosted by another daemon are outside this connection's discovery scope.
+### Can I use Codex from my phone without SSH?
 
-## Run as a background service on Linux
+Yes. Once Discordex is running on your development machine, use Discord to message your linked Codex sessions, follow progress, and respond to supported approval prompts. Your development machine must remain running and connected.
 
-An example user service is provided in [`deploy/discordex.service`](deploy/discordex.service). Adjust the checkout path and Bun path if necessary, then:
+### Can friends work with the same coding agent?
 
-```sh
-mkdir -p ~/.config/systemd/user
-cp deploy/discordex.service ~/.config/systemd/user/discordex.service
-systemctl --user daemon-reload
-systemctl --user enable --now discordex
-journalctl --user -u discordex -f
-```
+Yes. Add their Discord user IDs to the contributor allowlist. Messages carry the sender's identity, and multiple people can join the same session thread. Approval access is configured separately.
 
-Use `systemctl --user stop discordex` to stop the bot. The service uses your existing config and `.env` in the checkout. If it must keep running after your last login session ends, enable user lingering according to your host's systemd setup.
+### Does my local Codex client stay connected?
 
-## Recovery and limits
+Yes. Discordex attaches to the shared daemon alongside your local client. It discovers loaded sessions on that daemon within your configured project roots. Sessions using `--no-daemon` or a different daemon are outside its discovery scope.
 
-Codex is authoritative for session history and pending requests. Discordex saves event-derived deliveries before sending them and uses stable keys to ignore repeated events. It uses Discord nonces to reduce duplicate sends around network failures. Discord's nonce deduplication window is finite: a crash after Discord accepted a message but before its ID was saved can still cause a duplicate after a sufficiently long outage. There is no exactly-once guarantee across the two services.
+### Are images and voice supported?
 
-Incoming messages use the Discord message ID as Codex's `clientUserMessageId`. Uncertain submissions are reconciled against the daemon's queue and history; they are not blindly replayed. Ordinary messages received while disconnected stay in the local inbox. Deleted or unavailable Discord messages cannot be recovered.
+Not yet. Input attachments and voice messages are not ingested; only accompanying text is forwarded. Long text responses can be attached as files, but image previews are not implemented.
 
-Reconnecting reattaches tracked threads and reads history from the last processed turn. This keeps those conversations loaded in the shared daemon while Discordex is running. State and transcripts are retained locally; automatic pruning is not implemented yet. Do not delete the state directory unless you intend to reset mappings and delivery history.
+### Can I see or change the model in Discord?
 
-Live daemon discovery and subscription have been checked locally. The automated suite exercises the protocol over a Unix WebSocket, queue recovery, output recovery, and approvals with simulated peers. A real Discord bot token is required to validate the complete phone → Discord → Codex workflow.
+Cards display the model and reasoning effort when available. These start from captured session settings; a daemon-reported model reroute updates the turn's label. They are not a per-step execution audit. There is currently no Discord command for changing model settings. See [turn cards and model labels](docs/architecture.md#turn-cards-and-model-labels).
+
+### Is self-hosted the same as keeping all data local?
+
+The bridge and Codex daemon run on your host. Exported output, commands, and diffs are sent to Discord and stored locally for delivery. Channel membership controls who can read them; the bot's allowlists control who can submit work or approve actions. See [access and data](docs/configuration.md#access-and-data).
+
+### Is this a Codex plugin I can install today?
+
+Today you run the Bun host service from this repository. Codex plugin installation and management packaging are planned. Some approval types still require the local client; see [approval behavior](docs/configuration.md#approval-behavior).
 
 ## Development
 
 ```sh
+bun install --frozen-lockfile
 bun run check
 bun test
 bun run build
 ```
 
-`bun dev` watches the source. `bun run build` produces a Bun-targeted entry point in `dist/`; production can also run the TypeScript source directly. Standard `node:` compatibility modules and `ws` are used where needed by the Unix WebSocket/Discord transports; Node is not a runtime dependency.
+Use `bun dev` for watch mode. The build produces a Bun-targeted entry point in `dist/`; production can also run the TypeScript source directly. **Node.js is not a runtime dependency.**
 
-The protocol subset is in `src/types.ts`. Compare it with `codex app-server generate-ts --experimental --out <temporary-directory>` when updating supported Codex versions. See the [Codex app-server documentation](https://learn.chatgpt.com/docs/app-server) and [Discord Gateway documentation](https://docs.discord.com/developers/events/gateway) for the underlying interfaces.
+The [architecture guide](docs/architecture.md#source-map) maps the code and explains protocol compatibility. Bug reports and feature requests belong in [GitHub Issues](https://github.com/hzcafe/discordex/issues); include your Bun/Codex versions and reproduction steps, with tokens and private conversation content removed. Pull requests should include the relevant checks above.

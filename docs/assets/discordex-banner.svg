@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">Discordex — your Codex agents, one Discord away</title>
+  <desc id="desc">A Discord-inspired illustration showing a project thread, a message to a coding agent, and a compact response card. The bridge runs on your own development machine.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1280" y2="560" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171822"/>
+      <stop offset="1" stop-color="#22243c"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(1050 0) rotate(110) scale(660 750)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5865f2" stop-opacity=".26"/>
+      <stop offset="1" stop-color="#5865f2" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="frame"><rect width="1280" height="560" rx="24"/></clipPath>
+    <clipPath id="window"><rect x="598" y="54" width="628" height="446" rx="16"/></clipPath>
+  </defs>
+  <g clip-path="url(#frame)">
+    <rect width="1280" height="560" fill="url(#background)"/>
+    <rect width="1280" height="560" fill="url(#glow)"/>
+    <path d="M0 496H1280M0 528H1280M1152 0V560M1184 0V560M1216 0V560" stroke="#8a91fa" stroke-opacity=".06"/>
+    <circle cx="1134" cy="78" r="218" stroke="#a4aaff" stroke-opacity=".08"/>
+    <circle cx="1134" cy="78" r="270" stroke="#a4aaff" stroke-opacity=".06"/>
+
+    <rect x="54" y="54" width="48" height="48" rx="15" fill="#5865f2"/>
+    <path d="m68 68 9 10-9 10m14 0h9" stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <g font-family="DejaVu Sans, Arial, sans-serif">
+      <text x="116" y="87" font-size="30" font-weight="700" letter-spacing="-.7" fill="#f2f3f5">discordex</text>
+      <text x="54" y="168" font-size="16" font-weight="700" letter-spacing="3" fill="#aeb5ff">YOUR HOST. YOUR AGENTS. YOUR SERVER.</text>
+      <text x="50" y="245" font-size="57" font-weight="700" letter-spacing="-2" fill="#ffffff">Codex, meet</text>
+      <text x="50" y="312" font-size="62" font-weight="700" letter-spacing="-2" fill="#a4acff">Discord.</text>
+      <text x="54" y="367" font-size="22" fill="#c4c7d5">Send work. Follow along. Bring friends.</text>
+      <text x="54" y="400" font-size="22" fill="#c4c7d5">All from the chat already on your phone.</text>
+
+      <rect x="54" y="447" width="160" height="38" rx="19" fill="#5865f2" fill-opacity=".19" stroke="#5865f2" stroke-opacity=".5"/>
+      <circle cx="75" cy="466" r="4" fill="#57f287"/>
+      <text x="88" y="472" font-size="16" font-weight="600" fill="#e0e3ff">Self-hosted</text>
+      <rect x="226" y="447" width="138" height="38" rx="19" fill="#ffffff" fill-opacity=".04" stroke="#ffffff" stroke-opacity=".12"/>
+      <text x="246" y="472" font-size="16" font-weight="600" fill="#d3d6e3">Built on Bun</text>
+
+      <rect x="598" y="64" width="628" height="446" rx="16" fill="#0b0c13" fill-opacity=".35"/>
+      <g clip-path="url(#window)">
+        <rect x="598" y="54" width="628" height="446" fill="#313338"/>
+        <rect x="598" y="54" width="68" height="446" fill="#1e1f22"/>
+        <rect x="598" y="54" width="628" height="58" fill="#2b2d31"/>
+        <rect x="598" y="54" width="68" height="58" fill="#1e1f22"/>
+        <rect x="612" y="70" width="40" height="40" rx="13" fill="#5865f2"/>
+        <path d="m623 81 7 8-7 8m12 0h6" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <rect x="598" y="82" width="4" height="19" rx="2" fill="#f2f3f5"/>
+        <circle cx="632" cy="141" r="20" fill="#383a40"/>
+        <path d="M625 141h14m-7-7v14" stroke="#8c93a6" stroke-width="2" stroke-linecap="round"/>
+        <circle cx="632" cy="195" r="20" fill="#383a40"/>
+        <path d="M624 191h16m-16 7h16m-10-12-3 17m10-17-3 17" stroke="#8c93a6" stroke-width="1.7"/>
+        <text x="690" y="91" font-size="23" fill="#949ba4">#</text>
+        <text x="717" y="91" font-size="20" font-weight="700" fill="#f2f3f5">codex</text>
+        <path d="m798 77 6 6-6 6" stroke="#949ba4" stroke-width="2" stroke-linecap="round"/>
+        <text x="820" y="91" font-size="19" fill="#b5bac1">your-project</text>
+        <circle cx="1189" cy="83" r="5" fill="#57f287"/>
+
+        <circle cx="709" cy="155" r="20" fill="#454a73"/>
+        <text x="709" y="162" text-anchor="middle" font-size="20" font-weight="700" fill="#d9dcff">Y</text>
+        <text x="742" y="151" font-size="18" font-weight="700" fill="#f2f3f5">You</text>
+        <text x="790" y="151" font-size="14" fill="#b5bac1">just now</text>
+        <text x="742" y="181" font-size="20" fill="#dbdee1">Fix the failing test and explain the change.</text>
+
+        <circle cx="709" cy="242" r="20" fill="#5865f2"/>
+        <path d="m699 234 7 8-7 8m12 0h7" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="742" y="238" font-size="18" font-weight="700" fill="#f2f3f5">discordex</text>
+        <rect x="850" y="223" width="43" height="19" rx="4" fill="#5865f2"/>
+        <text x="871" y="237" text-anchor="middle" font-size="12" font-weight="700" fill="white">APP</text>
+
+        <rect x="742" y="255" width="455" height="145" rx="10" fill="#2b2d31" stroke="#42444c"/>
+        <path d="M744 267v121" stroke="#5865f2" stroke-width="3" stroke-linecap="round"/>
+        <text x="762" y="287" font-size="20" font-weight="700" fill="#f2f3f5">Fixed the retry logic.</text>
+        <text x="762" y="319" font-size="18" fill="#dbdee1">The test now passes. Retries keep their delay.</text>
+        <path d="M762 340h415" stroke="#42444c"/>
+        <circle cx="768" cy="371" r="4" fill="#57f287"/>
+        <text x="782" y="377" font-size="16" fill="#b5bac1">Codex · Complete</text>
+
+        <rect x="690" y="427" width="507" height="46" rx="8" fill="#383a40"/>
+        <circle cx="714" cy="450" r="10" fill="#b5bac1"/>
+        <path d="M709 450h10m-5-5v10" stroke="#383a40" stroke-width="2"/>
+        <text x="737" y="457" font-size="17" fill="#b5bac1">Message your agent…</text>
+      </g>
+      <rect x="598.5" y="54.5" width="627" height="445" rx="15.5" stroke="#a4aaff" stroke-opacity=".2"/>
+      <text x="912" y="532" text-anchor="middle" font-size="14" fill="#a6abc3">ILLUSTRATED WORKFLOW · ONE TURN, ONE UPDATING MESSAGE</text>
+    </g>
+  </g>
+</svg>
