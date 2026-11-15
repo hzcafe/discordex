@@ -38,7 +38,7 @@ test('usage is an ephemeral Components V2 card and an account read never occupie
     const container = edited.components[0].toJSON();
     expect(container.type).toBe(ComponentType.Container);
     expect(JSON.stringify(container)).toContain('65% left');
-    expect(JSON.stringify(container)).toContain('█████████████░░░░░░░');
+    expect(JSON.stringify(container)).toContain('🟦🟦🟦🟦🟦🟦⬛⬛⬛⬛');
     expect(edited.allowedMentions.parse).toEqual([]);
     expect(edited.files).toHaveLength(0);
   } finally { await adapter.close(); await bridge.stop(); store.close(); }

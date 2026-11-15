@@ -32,16 +32,17 @@ function windowLines(window: RateLimitWindow, fallback: string, prefix: string, 
   const left = remaining(window);
   const title = `${prefix}${windowName(window, fallback)} allowance`;
   if (left === null) return `**${title}** · Usage unavailable`;
-  // Monospace blocks make a compact bar without uploads or custom server emoji.
+  // Ten native emoji segments fit on mobile and render outside code formatting.
   // Floor segments so the bar never overstates the available allowance.
-  const filled = Math.floor(left / 5);
-  const bar = '█'.repeat(filled) + '░'.repeat(20 - filled);
+  const filled = Math.floor(left / 10);
+  const color = left <= 10 ? '🟥' : left <= 20 ? '🟨' : '🟦';
+  const bar = color.repeat(filled) + '⬛'.repeat(10 - filled);
   const percent = left > 0 && left < 0.1 ? '<0.1' : number.format(left < 100 ? Math.min(left, 99.9) : left);
   let reset = 'Reset time unavailable';
   if (count(window.resetsAt) && window.resetsAt > 0) {
     reset = window.resetsAt > now ? `Resets <t:${window.resetsAt}:R>` : 'Reset time passed · Run `/codex usage` to check again';
   }
-  return `**${title} · ${percent}% left**\n\`${bar}\`\n-# ${reset}`;
+  return `**${title} · ${percent}% left**\n${bar}\n-# ${reset}`;
 }
 
 /** A fresh account snapshot plus an independently timestamped session counter. */

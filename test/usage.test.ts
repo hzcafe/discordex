@@ -10,7 +10,7 @@ const limits = (usedPercent: number): AccountRateLimits => ({ rateLimits: { limi
 test('the allowance bar shows remaining quota and derives its label from the actual window', () => {
   const delivery = usageCard(limits(35), undefined, undefined, now);
   expect(delivery.content).toContain('Weekly allowance · 65% left');
-  expect(delivery.content).toContain('`█████████████░░░░░░░`');
+  expect(delivery.content).toContain('\n🟦🟦🟦🟦🟦🟦⬛⬛⬛⬛\n');
   expect(delivery.content).toContain(`Resets <t:${now + 3600}:R>`);
   expect(delivery.content).not.toContain('Session tokens');
   expect(delivery.card?.footer).toBe('Host account · Shared across sessions');
@@ -29,7 +29,7 @@ test('missing metrics stay unavailable, while zero, exhausted, and fractional al
     const rendered = usageCard(limits(invalid as any));
     expect(rendered.content).toContain('Usage unavailable');
     expect(rendered.content).not.toContain('% left');
-    expect(rendered.content).not.toContain('█');
+    expect(rendered.content).not.toMatch(/[🟦🟨🟥⬛]/u);
   }
   expect(usageCard({ rateLimits: { primary: null, secondary: null } }).content).toContain('Allowance unavailable');
   expect(usageCard(null).content).toContain('Account allowance unavailable');
@@ -44,7 +44,10 @@ test('backend blocking overrides apparently available quota and past reset times
   expect(expired.content).toContain('0% left');
   expect(expired.content).toContain('Reset time passed');
   expect(expired.card?.tone).toBe('danger');
+  expect(expired.content).toContain('\n⬛⬛⬛⬛⬛⬛⬛⬛⬛⬛\n');
   expect(usageCard(limits(85)).card?.tone).toBe('warning');
+  expect(usageCard(limits(85)).content).toContain('\n🟨⬛⬛⬛⬛⬛⬛⬛⬛⬛\n');
+  expect(usageCard(limits(90)).content).toContain('\n🟥⬛⬛⬛⬛⬛⬛⬛⬛⬛\n');
   const spendLimit = usageCard({ ordinaryUsageAllowed: true, rateLimits: { primary: window(0), spendControlReached: true } });
   expect(spendLimit.content).toContain('An account limit has been reached');
   expect(spendLimit.content).not.toContain('Included usage is currently blocked');

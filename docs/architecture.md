@@ -48,7 +48,7 @@ Footers show model and reasoning effort when available. The initial values are c
 
 ## Usage cards
 
-`/codex usage` reads `account/rateLimits/read` on demand and renders an ephemeral Components V2 card. Monospace progress bars show the remaining percentage for each reported quota window; window labels come from the reported duration. Multiple quota buckets are supported, with up to four groups shown to keep the card compact. Discord timestamps display reset times relative to the reader. Explicit backend blocking takes precedence over apparently available percentages, and elapsed reset times never imply a refilled allowance.
+`/codex usage` reads `account/rateLimits/read` on demand and renders an ephemeral Components V2 card. Ten-segment emoji bars visualize the remaining allowance alongside its percentage: blue normally, yellow at 20% or below, and red at 10% or below, with dark empty segments. Window labels come from the reported duration. Multiple quota buckets are supported, with up to four groups shown to keep the card compact. Discord timestamps display reset times relative to the reader. Explicit backend blocking takes precedence over apparently available percentages, and elapsed reset times never imply a refilled allowance.
 
 This read runs outside the bridge's serial work queue so a slow account service cannot delay approvals or turns. Account limits are fetched afresh and are not persisted. Unavailable limits, unsupported methods, and daemon disconnects produce a readable status rather than a guessed allowance.
 
