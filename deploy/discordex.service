@@ -1,0 +1,18 @@
+[Unit]
+Description=Discordex Discord bridge for the local Codex daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust these paths to the checkout and Bun installation on this host.
+WorkingDirectory=%h/dev/discordex
+ExecStart=%h/.bun/bin/bun src/cli.ts start
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,9 @@
+{
+  "guildId": "YOUR_DISCORD_SERVER_ID",
+  "channelId": "YOUR_DISCORD_TEXT_CHANNEL_ID",
+  "allowedUserIds": ["YOUR_DISCORD_USER_ID"],
+  "approverUserIds": ["YOUR_DISCORD_USER_ID"],
+  "autoDiscover": true,
+  "projectRoots": ["/absolute/path/to/your/project"],
+  "verbosity": "quiet"
+}
