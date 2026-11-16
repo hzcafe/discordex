@@ -1,4 +1,5 @@
 import type { Approval } from './store.js';
+import { approvalActions } from './approvals.js';
 import { basename } from 'node:path';
 import type { Binding, Button, Delivery, Item, Packet, TurnState } from './types.js';
 
@@ -79,23 +80,18 @@ export function approvalDelivery(approval: Approval, binding?: Binding): Deliver
     p.permissions ? `**Requested permissions**\n${JSON.stringify(p.permissions)}` : ''].filter(Boolean);
   if (packet.method === 'item/fileChange/requestApproval') details.push(p.discordexDiff || 'The proposed diff is unavailable. Review and answer in your local Codex client.');
   if (p.questions) for (const q of p.questions) details.push(`**${q.question}**\n${(q.options ?? []).map((o: any) => `- **${o.label}** — ${o.description}`).join('\n')}`);
-  let buttons: Button[] = [];
-  const button = (action: string, text: string, danger = false): Button => ({ id: `dx:${approval.token}:${action}`, label: text,
-    style: action === 'accept' ? 'success' : action === 'cancel' ? 'secondary' : danger ? 'danger' : 'primary' });
-  if (approval.state === 'pending') {
+  const actions = approval.state === 'pending' ? approvalActions(packet) : [];
+  const permissions = packet.method === 'item/permissions/requestApproval';
+  const labels = { accept: permissions ? 'Allow for this turn' : 'Approve once', decline: permissions ? 'Deny' : 'Decline', cancel: 'Cancel turn', answer: 'Answer' };
+  const buttons: Button[] = actions.map(action => ({ id: `dx:${approval.token}:${action}`, label: labels[action],
+    style: action === 'accept' ? 'success' : action === 'cancel' ? 'secondary' : action === 'decline' ? 'danger' : 'primary' }));
+  if (approval.state === 'pending' && !actions.length) {
     if (packet.method === 'item/tool/requestUserInput') {
-      if (p.questions?.length <= 5 && !p.questions.some((q: any) => q.isSecret)) buttons = [button('answer', 'Answer')];
-      else details.push('Answer this request in the local Codex client.');
-    } else if (packet.method === 'item/permissions/requestApproval') {
-      buttons = [button('accept', 'Allow for this turn'), button('decline', 'Deny', true)];
+      details.push('Answer this request in the local Codex client.');
     } else if (['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(packet.method!)) {
-      const available = p.availableDecisions ?? ['accept', 'decline', 'cancel'];
-      buttons = [button('accept', 'Approve once'), button('decline', 'Decline', true), button('cancel', 'Cancel turn', true)]
-        .filter(b => available.includes(b.id.split(':').at(-1)));
-      if (packet.method === 'item/fileChange/requestApproval' && !p.discordexDiff) buttons = [];
-      if (!buttons.length) details.push('Use the local Codex client for this approval type.');
+      details.push('Use the local Codex client for this approval type.');
     } else details.push('This request type requires the local Codex client.');
-  } else details.push(`**${approval.state === 'expired' ? 'Connection changed. Use a newly replayed prompt or the local client.' : approval.state === 'submitted' ? 'Decision submitted; waiting for Codex.' : 'Resolved in Codex.'}**`);
+  } else if (approval.state !== 'pending') details.push(`**${approval.state === 'expired' ? 'Connection changed. Use a newly replayed prompt or the local client.' : approval.state === 'submitted' ? 'Decision submitted; waiting for Codex.' : 'Resolved in Codex.'}**`);
   const title = approval.state === 'pending' ? (packet.method === 'item/tool/requestUserInput' ? 'Your input is needed' : 'Approval needed')
     : approval.state === 'submitted' ? 'Response submitted' : approval.state === 'expired' ? 'Prompt expired' : 'Prompt resolved';
   return card(details.join('\n\n'), { title, subtitle: binding?.label ?? 'Codex',

@@ -6,6 +6,7 @@ import { CodexClient } from './codex.js';
 import { Store } from './store.js';
 import { Bridge } from './bridge.js';
 import { DiscordAdapter } from './discord.js';
+import { bridgeRunner } from './runner.js';
 
 async function doctor(): Promise<void> {
   const path = Bun.env.DISCORDEX_CONFIG || 'discordex.config.json';
@@ -32,23 +33,23 @@ async function start(): Promise<void> {
   const codex = new CodexClient(config.socketPath);
   const discord = new DiscordAdapter(config, store);
   const bridge = new Bridge(config, codex, store, discord);
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return; stopping = true;
-    codex.stop(); await discord.close(); await bridge.stop(); store.release(); store.close();
-  };
-  process.once('SIGINT', () => { void stop(); });
-  process.once('SIGTERM', () => { void stop(); });
-  try {
+  const runner = bridgeRunner(codex, discord, bridge, store, async () => {
     if (!existsSync(config.socketPath) && config.socketPath === defaultSocket()) {
       const daemon = Bun.spawn(['codex', 'app-server', 'daemon', 'start'], { stdout: 'inherit', stderr: 'inherit' });
       if (await daemon.exited !== 0) throw new Error('Could not start the shared Codex daemon');
     }
-    await discord.login(token);
-    discord.connect(bridge); bridge.start(); codex.start();
+  }, () => discord.connect(bridge));
+  const stop = () => { void runner.stop().catch(error => { console.error(error); process.exitCode = 1; }); };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  try {
+    await runner.start(token);
     codex.on('diagnostic', text => console.error(`Codex: ${text}`));
     codex.on('ready', () => console.log('Discordex connected to Discord and the shared Codex daemon'));
-  } catch (error) { await stop(); throw error; }
+  } catch (error) {
+    try { await runner.stop(); } catch (cleanupError) { console.error(cleanupError); }
+    throw error;
+  }
 }
 
 const command = Bun.argv[2] ?? 'help';

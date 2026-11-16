@@ -4,8 +4,10 @@ import { dirname } from 'node:path';
 import type { Binding, Delivery, GoalCardState, Item, Packet, TokenUsageSnapshot, TurnState } from './types.js';
 
 export interface Outgoing { key: string; channel: string; payload: string; message: string | null; attempts: number; revision: number }
-export interface Approval { token: string; epoch: string; rpcId: string; threadId: string; channel: string; packet: string; state: string }
-export interface Input { id: string; threadId: string; text: string; state: string; queueId: string | null }
+export type ApprovalState = 'pending' | 'submitted' | 'resolved' | 'expired';
+export type InputState = 'new' | 'submitting' | 'unknown' | 'queued' | 'delivered';
+export interface Approval { token: string; epoch: string; rpcId: string; threadId: string; channel: string; packet: string; state: ApprovalState }
+export interface Input { id: string; threadId: string; text: string; state: InputState; queueId: string | null }
 
 export class Store {
   readonly db: Database;
@@ -109,7 +111,7 @@ export class Store {
       .run(token, epoch, rpcId, packet.params!.threadId, channel, JSON.stringify(packet));
     return this.approval(token)!;
   }
-  approvalState(token: string, state: string): void { this.db.query('UPDATE approvals SET state = ? WHERE token = ?').run(state, token); }
+  approvalState(token: string, state: ApprovalState): void { this.db.query('UPDATE approvals SET state = ? WHERE token = ?').run(state, token); }
   resolveApproval(epoch: string, rpcId: unknown): Approval | undefined {
     return this.db.query<Approval, [string, string]>('SELECT * FROM approvals WHERE epoch = ? AND rpcId = ?').get(epoch, JSON.stringify(rpcId)) ?? undefined;
   }
@@ -121,7 +123,7 @@ export class Store {
       ? this.db.query<Input, [string]>('SELECT * FROM inputs WHERE threadId = ? ORDER BY rowid').all(threadId)
       : this.db.query<Input, []>('SELECT * FROM inputs ORDER BY rowid').all();
   }
-  inputState(id: string, state: string, queueId: string | null = null): void {
+  inputState(id: string, state: InputState, queueId: string | null = null): void {
     this.db.query('UPDATE inputs SET state = ?, queueId = COALESCE(?, queueId) WHERE id = ?').run(state, queueId, id);
   }
   saveItem(threadId: string, item: Item): void { this.db.query('INSERT OR REPLACE INTO items VALUES (?, ?, ?)').run(threadId, item.id, JSON.stringify(item)); }

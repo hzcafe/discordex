@@ -20,6 +20,7 @@ export class DiscordAdapter implements ChatPort {
   private recovering = false;
   private closed = false;
   private buffered: Message[] = [];
+  private nonTextReplies = new Map<string, Promise<void>>();
   constructor(private config: Config, private store: Store) {}
 
   async login(token: string): Promise<void> {
@@ -87,6 +88,7 @@ export class DiscordAdapter implements ChatPort {
             const page = await channel.messages.fetch({ after: cursor, limit: 100 });
             const ordered = [...page.values()].sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
             for (const msg of ordered) {
+              if (this.closed) break;
               await this.receive(msg);
               cursor = msg.id; this.store.setMeta(key, cursor);
             }
@@ -104,10 +106,23 @@ export class DiscordAdapter implements ChatPort {
     }
   }
   private async receive(msg: Message): Promise<void> {
-    if (!this.bridge || msg.guildId !== this.config.guildId || msg.author.bot || msg.webhookId || !this.store.byChannel(msg.channelId)) return;
+    if (this.closed || !this.bridge || msg.guildId !== this.config.guildId || msg.author.bot || msg.webhookId || !this.store.byChannel(msg.channelId)) return;
     if (!this.config.allowedUserIds.includes(msg.author.id)) return;
     if (!msg.content.trim()) {
-      await msg.reply({ content: 'This version forwards text messages. Add text describing the attachment or task.', allowedMentions: { parse: [], repliedUser: false } });
+      // Unlike text submissions, warnings have no input row to deduplicate them.
+      // Share in-flight replies and persist success without moving the history cursor.
+      const key = `non-text-reply:${msg.id}`;
+      if (this.store.getMeta(key)) return;
+      let pending = this.nonTextReplies.get(msg.id);
+      if (!pending) {
+        pending = Promise.resolve().then(async () => {
+          await msg.reply({ content: 'This version forwards text messages. Add text describing the attachment or task.',
+            nonce: deliveryNonce(key), enforceNonce: true, allowedMentions: { parse: [], repliedUser: false } });
+          this.store.setMeta(key, 'sent');
+        }).finally(() => { this.nonTextReplies.delete(msg.id); });
+        this.nonTextReplies.set(msg.id, pending);
+      }
+      await pending;
       return;
     }
     try {
@@ -119,6 +134,7 @@ export class DiscordAdapter implements ChatPort {
     }
   }
   private async interact(interaction: Interaction): Promise<void> {
+    if (this.closed) return;
     if (!interaction.isChatInputCommand() && !interaction.isButton() && !interaction.isModalSubmit()) return;
     if (interaction.isChatInputCommand() && interaction.commandName !== 'codex') return;
     if (!interaction.isChatInputCommand() && !interaction.customId.startsWith('dx:')) return;
@@ -149,6 +165,7 @@ export class DiscordAdapter implements ChatPort {
         await interaction.showModal(modal); return;
       }
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (this.closed) throw new Error('Discordex is shutting down. Try this action again after it reconnects.');
       let result = 'Done';
       let delivery: Delivery | undefined;
       const bridge = this.bridge!;
@@ -207,6 +224,7 @@ export class DiscordAdapter implements ChatPort {
       await interaction.showModal(modal); return;
     }
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    if (this.closed) throw new Error('Discordex is shutting down. Try this action again after it reconnects.');
     let result = 'Goal card updated.';
     await bridge.serial(async () => {
       if (!control) await bridge.showGoal(channelId, interaction.user.id);
@@ -259,6 +277,7 @@ export class DiscordAdapter implements ChatPort {
   async close(): Promise<void> {
     this.closed = true; clearInterval(this.inboxTimer);
     while (this.recovering) await Bun.sleep(25);
+    await Promise.allSettled(this.nonTextReplies.values());
     await this.client.destroy();
   }
 }

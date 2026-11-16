@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ComponentType, Events, MessageFlags } from 'discord.js';
 import { DiscordAdapter } from '../src/discord.js';
 import { Bridge } from '../src/bridge.js';
@@ -160,6 +163,140 @@ test('Discord history recovery paginates, filters bot/unauthorized messages, and
     await adapter.catchUp();
     expect(store.inputs()).toHaveLength(248);
   } finally { await adapter.close(); await bridge.stop(); store.close(); }
+});
+
+test('non-text warnings deduplicate concurrent receipt, recovery, and restart while failed replies can retry', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-non-text-'));
+  const path = join(dir, 'state.sqlite');
+  let store = new Store(path);
+  const config = { guildId: 'guild', channelId: 'parent', allowedUserIds: ['alice'], approverUserIds: ['alice'] } as Config;
+  store.saveBinding({ threadId: 't1', parentThreadId: null, channelId: '100', label: 'Project', cwd: '/work',
+    since: 0, initialTurnId: null, checkpoint: null });
+  let replies = 0;
+  let release!: () => void;
+  let fail = true;
+  const message = { id: '101', guildId: 'guild', channelId: '100', content: '', author: { id: 'alice', bot: false },
+    webhookId: null, reply: async (payload: any) => {
+      replies++;
+      expect(payload.enforceNonce).toBe(true);
+      if (fail) throw new Error('Reply failed');
+      await new Promise<void>(resolve => { release = resolve; });
+    } };
+  const setup = () => {
+    const adapter = new DiscordAdapter(config, store);
+    (adapter as any).bridge = { eligible: () => true };
+    adapter.client.channels.fetch = (async () => ({ isThread: () => true, guildId: 'guild', parentId: 'parent',
+      messages: { fetch: async ({ after }: { after: string }) => new Map(after === '100' ? [['101', message]] : []) } })) as any;
+    return adapter;
+  };
+  let adapter = setup();
+  try {
+    await expect((adapter as any).receive(message)).rejects.toThrow('Reply failed');
+    expect(store.getMeta('non-text-reply:101')).toBeNull();
+    fail = false;
+    const live = (adapter as any).receive(message);
+    const duplicate = (adapter as any).receive(message);
+    const recovery = adapter.catchUp();
+    await Promise.resolve();
+    expect(replies).toBe(2);
+    expect(store.getMeta('inbox-cursor:100')).toBeNull();
+    release();
+    await Promise.all([live, duplicate, recovery]);
+    expect(store.getMeta('inbox-cursor:100')).toBe('101');
+    expect(store.getMeta('non-text-reply:101')).toBe('sent');
+    await adapter.close();
+    store.close();
+    store = new Store(path);
+    adapter = setup();
+    // Replay even if a crash left history behind the successfully sent warning.
+    store.setMeta('inbox-cursor:100', '100');
+    await adapter.catchUp();
+    await (adapter as any).receive(message);
+    expect(replies).toBe(2);
+    expect(store.getMeta('inbox-cursor:100')).toBe('101');
+  } finally { await adapter.close(); store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('shutdown waits for live non-text replies and ignores late inputs after the store closes', async () => {
+  for (const fail of [false, true]) {
+    const store = new Store(':memory:');
+    store.saveBinding({ threadId: 't1', parentThreadId: null, channelId: '100', label: 'Project', cwd: '/work',
+      since: 0, initialTurnId: null, checkpoint: null });
+    const adapter = new DiscordAdapter({ guildId: 'guild', channelId: 'parent', allowedUserIds: ['alice'] } as Config, store);
+    (adapter as any).bridge = {};
+    let release!: () => void;
+    let replies = 0;
+    const message = { id: '101', guildId: 'guild', channelId: '100', content: '', author: { id: 'alice', bot: false },
+      webhookId: null, reply: async () => {
+        replies++;
+        await new Promise<void>(resolve => { release = resolve; });
+        if (fail) throw new Error('Reply failed');
+      } };
+    const received = (adapter as any).receive(message).catch((error: Error) => error);
+    await Promise.resolve();
+    let closed = false;
+    const closing = adapter.close().then(() => { closed = true; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    release();
+    await closing;
+    expect(store.getMeta('non-text-reply:101')).toBe(fail ? null : 'sent');
+    expect((await received) instanceof Error).toBe(fail);
+    store.close();
+    await (adapter as any).receive(message);
+    await (adapter as any).interact({});
+    expect(replies).toBe(1);
+  }
+});
+
+test('commands acknowledged during shutdown cannot start work after the store closes', async () => {
+  for (const subcommand of ['status', 'goal']) {
+    const store = new Store(':memory:');
+    const config: Config = { guildId: 'guild', channelId: 'parent', allowedUserIds: ['alice'], approverUserIds: ['alice'],
+      autoDiscover: false, projectRoots: [], socketPath: '/unused', stateDir: '/unused' };
+    store.saveBinding({ threadId: 't1', channelId: 'thread', parentThreadId: null, cwd: '/work', label: 'Project', since: 0, initialTurnId: null, checkpoint: null });
+    let requests = 0;
+    const codex = Object.assign(new EventEmitter(), { connected: false, epoch: 'one',
+      request: async () => { requests++; throw new Error('Unexpected request'); }, respond: async () => {} }) as CodexPort;
+    const adapter = new DiscordAdapter(config, store);
+    const bridge = new Bridge(config, codex, store, adapter, () => {});
+    (adapter as any).bridge = bridge;
+    let release!: () => void;
+    const acknowledged = new Promise<void>(resolve => { release = resolve; });
+    let edited: any;
+    const interaction = { isChatInputCommand: () => true, isButton: () => false, isModalSubmit: () => false,
+      commandName: 'codex', guildId: 'guild', channelId: 'thread', user: { id: 'alice' },
+      options: { getSubcommand: () => subcommand }, deferred: true, replied: false,
+      deferReply: () => acknowledged, editReply: async (payload: any) => { edited = payload; } };
+    const handling = (adapter as any).interact(interaction);
+    await adapter.close(); await bridge.stop(); store.close();
+    release(); await handling;
+    expect(JSON.stringify(edited)).toContain('Discordex is shutting down');
+    expect(JSON.stringify(edited)).not.toContain('closed database');
+    expect(requests).toBe(0);
+  }
+});
+
+test('shutdown does not advance recovery past fetched messages it has not received', async () => {
+  const store = new Store(':memory:');
+  store.saveBinding({ threadId: 't1', parentThreadId: null, channelId: '100', label: 'Project', cwd: '/work',
+    since: 0, initialTurnId: null, checkpoint: null });
+  const adapter = new DiscordAdapter({ guildId: 'guild', channelId: 'parent' } as Config, store);
+  (adapter as any).bridge = { eligible: () => true };
+  let fetched!: (messages: Map<string, any>) => void;
+  const pending = new Promise<Map<string, any>>(resolve => { fetched = resolve; });
+  let fetchStarted!: () => void;
+  const started = new Promise<void>(resolve => { fetchStarted = resolve; });
+  adapter.client.channels.fetch = (async () => ({ isThread: () => true, guildId: 'guild', parentId: 'parent',
+    messages: { fetch: () => { fetchStarted(); return pending; } } })) as any;
+  try {
+    const recovery = adapter.catchUp();
+    await started;
+    const closing = adapter.close();
+    fetched(new Map([['101', { id: '101' }]]));
+    await Promise.all([recovery, closing]);
+    expect(store.getMeta('inbox-cursor:100')).toBeNull();
+  } finally { await adapter.close(); store.close(); }
 });
 
 test('restart reuses an existing Discord thread when its channel is not cached', async () => {

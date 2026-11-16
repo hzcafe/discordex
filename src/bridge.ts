@@ -1,7 +1,8 @@
 import { relative, isAbsolute, basename } from 'node:path';
 import type { Config } from './config.js';
 import { RpcError } from './codex.js';
-import { Store } from './store.js';
+import { Store, type ApprovalState } from './store.js';
+import { approvalActions } from './approvals.js';
 import { approvalDelivery, deliveryNonce, message, sessionCard } from './render.js';
 import { TurnCards } from './turns.js';
 import { tokenUsageSnapshot, usageCard } from './usage.js';
@@ -277,7 +278,7 @@ export class Bridge {
     if (packet.params?.turnId) this.turns.refresh(binding, packet.params.turnId, true);
     void this.flush();
   }
-  private finishApproval(token: string, state: string): void {
+  private finishApproval(token: string, state: Exclude<ApprovalState, 'pending'>): void {
     this.store.approvalState(token, state);
     const approval = this.store.approval(token)!;
     const binding = this.store.binding(approval.threadId);
@@ -292,7 +293,7 @@ export class Bridge {
     if (!a || a.channel !== channelId || a.state !== 'pending' || a.epoch !== this.codex.epoch || !this.codex.connected) throw new Error('This prompt is no longer active');
     this.requireBinding(channelId);
     const p: Packet = JSON.parse(a.packet);
-    if (!approvalDelivery(a).buttons?.some(b => b.id === `dx:${token}:${action}`)) throw new Error('This decision is not offered for this request');
+    if (!approvalActions(p).some(offered => offered === action)) throw new Error('This decision is not offered for this request');
     let result: unknown;
     if (action === 'answer') {
       const values: Record<string, { answers: string[] }> = {};

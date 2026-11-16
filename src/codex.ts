@@ -20,12 +20,13 @@ export class CodexClient extends EventEmitter {
 
   start(): void { if (!this.stopped) return; this.stopped = false; this.connect(); }
   private connect(): void {
-    if (this.stopped) return;
+    if (this.stopped || this.socket) return;
     // Codex's control socket carries WebSocket frames, not raw JSONL.
     const ws = new WebSocket(`ws+unix://${this.socketPath}:/`, { handshakeTimeout: this.timeoutMs, maxPayload: 64 * 1024 * 1024 });
     this.socket = ws;
     this.epoch = crypto.randomUUID();
     ws.on('message', data => {
+      if (this.socket !== ws) return;
       let packet: Packet;
       try { packet = JSON.parse(data.toString()); }
       catch { ws.close(1002, 'Invalid JSON'); return; }
@@ -39,8 +40,9 @@ export class CodexClient extends EventEmitter {
         else pending.resolve(packet.result);
       }
     });
-    ws.on('error', error => this.emit('diagnostic', error.message));
+    ws.on('error', error => { if (this.socket === ws) this.emit('diagnostic', error.message); });
     ws.on('open', () => {
+      if (this.socket !== ws || this.stopped) return;
       void (async () => {
         await this.request('initialize', { clientInfo: { name: 'discordex', title: 'Discordex', version: '0.1.0' },
           capabilities: { experimentalApi: true, requestAttestation: false, requiredHumanApproval: true,
@@ -49,23 +51,29 @@ export class CodexClient extends EventEmitter {
               'item/fileChange/outputDelta', 'item/plan/delta'] } });
         if (this.stopped || this.socket !== ws || ws.readyState !== WebSocket.OPEN) return;
         await this.write({ method: 'initialized' });
+        if (this.stopped || this.socket !== ws || ws.readyState !== WebSocket.OPEN) return;
         this.connected = true; this.retryMs = 500;
         let alive = true;
         ws.on('pong', () => { alive = true; });
-        this.heartbeat = setInterval(() => { if (!alive) ws.terminate(); else { alive = false; ws.ping(); } }, 30_000);
+        this.heartbeat = setInterval(() => {
+          if (this.socket !== ws || this.stopped) return;
+          if (!alive) ws.terminate(); else { alive = false; ws.ping(); }
+        }, 30_000);
         this.emit('ready');
-      })().catch(error => { this.emit('diagnostic', String(error)); ws.terminate(); });
+      })().catch(error => { if (this.socket === ws) this.emit('diagnostic', String(error)); ws.terminate(); });
     });
     ws.on('close', () => {
+      if (this.socket !== ws) return;
+      this.socket = undefined;
       this.connected = false;
       clearInterval(this.heartbeat);
-      for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('Codex disconnected; request outcome may be unknown')); }
-      this.pending.clear();
-      this.emit('disconnected');
+      this.rejectPending();
       if (!this.stopped) {
-        this.reconnect = setTimeout(() => this.connect(), this.retryMs + Math.random() * 250);
+        const epoch = this.epoch;
+        this.reconnect = setTimeout(() => { if (this.epoch === epoch) this.connect(); }, this.retryMs + Math.random() * 250);
         this.retryMs = Math.min(this.retryMs * 2, 30_000);
       }
+      this.emit('disconnected');
     });
   }
   private write(packet: Packet): Promise<void> {
@@ -86,8 +94,16 @@ export class CodexClient extends EventEmitter {
     });
   }
   respond(id: RequestId, result: unknown): Promise<void> { return this.write({ id, result }); }
+  private rejectPending(): void {
+    for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('Codex disconnected; request outcome may be unknown')); }
+    this.pending.clear();
+  }
   stop(): void {
     this.stopped = true; this.connected = false; clearTimeout(this.reconnect); clearInterval(this.heartbeat);
-    this.socket?.terminate();
+    const ws = this.socket;
+    this.socket = undefined;
+    this.rejectPending();
+    ws?.terminate();
+    if (ws) this.emit('disconnected');
   }
 }

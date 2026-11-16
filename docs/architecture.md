@@ -66,6 +66,21 @@ Reconnects invalidate old approval controls. Only requests replayed by Codex rec
 
 State and transcripts remain on disk. Automatic pruning is not implemented, and deleting the state directory resets mappings and delivery history.
 
+## State and lifecycle invariants
+
+The bridge has several separate state machines. Their transitions use daemon evidence and persisted delivery records; they do not share a single global status.
+
+| State owner | States and invariants |
+| --- | --- |
+| Incoming messages | `new` → `submitting` → `queued` or `unknown`; matching queue entries recover uncertain acceptance, and matching history marks an input `delivered`. An accepted input disappearing from the queue is not evidence that it failed: another client may have consumed it. |
+| Approval prompts | `pending` → `submitted` → `resolved`, with `expired` when the connection changes or submission becomes uncertain. Only a pending prompt in the current connection epoch accepts an offered decision. Rendering and submission use the same approval rules. |
+| Turn cards | `inProgress` becomes `completed`, `interrupted`, or `failed`. Late activity cannot reopen a terminal turn; late completed assistant items can still repair its final text. |
+| Outbox | A successful send or edit acknowledges only the revision that was sent. Changes made during delivery stay pending, and further progress updates preserve retry backoff. |
+| Codex connection | Only the current socket can dispatch events or change connection state. Stop rejects pending requests immediately; callbacks from retired sockets cannot affect a replacement connection. |
+| CLI lifecycle | Shutdown prevents startup from continuing after asynchronous preparation or login. It waits for in-flight login before closing Discord, drains accepted work, and attempts every cleanup step even if an earlier step fails. |
+
+Attachment-only warning replies have their own durable receipt markers. Concurrent live/history receipts share one reply; failures remain retryable. Shutdown drains pending warning replies before closing SQLite. Live receipt never advances the history cursor past unseen messages. These markers have the same finite nonce-deduplication and retention limits as other deliveries.
+
 ## Shared goal cards
 
 `/codex goal` manages the same persisted top-level session goal as the local Codex `/goal` interface. The bot reads `thread/goal/get`, writes `thread/goal/set`, and removes goals with `thread/goal/clear`. Explicit button and modal actions include `origin: "user"`; observing or rendering goal events never changes goal state.
@@ -81,12 +96,14 @@ Budget edits omit the objective and status to preserve usage accounting. Creatin
 | File | Responsibility |
 | --- | --- |
 | [`src/cli.ts`](../src/cli.ts) | Startup, shutdown, daemon bootstrap, and the read-only `doctor` command |
+| [`src/runner.ts`](../src/runner.ts) | Startup cancellation and ordered cleanup across service resources |
 | [`src/config.ts`](../src/config.ts) | Settings, environment defaults, and validation |
 | [`src/codex.ts`](../src/codex.ts) | Unix WebSocket transport, requests, notifications, heartbeat, and reconnects |
 | [`src/bridge.ts`](../src/bridge.ts) | Discovery, event handling, message routing, approvals, and recovery |
 | [`src/discord.ts`](../src/discord.ts) | Discord Gateway/REST, slash commands, buttons, modals, and message catch-up |
 | [`src/turns.ts`](../src/turns.ts) | Durable per-agent turn state and model snapshots |
 | [`src/render.ts`](../src/render.ts) | Logical output and prompt rendering |
+| [`src/approvals.ts`](../src/approvals.ts) | Supported approval actions shared by rendering and decision validation |
 | [`src/components.ts`](../src/components.ts) | Compact Components V2 cards, footers, attachments, and controls |
 | [`src/usage.ts`](../src/usage.ts) | Remaining-allowance bars, quota windows, and reported session counters |
 | [`src/goals.ts`](../src/goals.ts) | Shared goal cards, input validation, control versions, and goal RPCs |

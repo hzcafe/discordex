@@ -313,18 +313,33 @@ test('multi-question responses keep question IDs, and secret questions stay loca
   await bridge.serverRequest({ ...packet, id: 8, params: { ...packet.params, questions: [{ id: 's', question: 'Secret', isSecret: true }] } });
   const secret = store.pendingApprovals().find(a => a.rpcId === '8')!;
   expect(approvalDelivery(secret).buttons).toEqual([]);
+  await expect(bridge.decide(secret.token, 'answer', 'c1', 'alice', { s: 'secret' })).rejects.toThrow('not offered');
+  expect(codex.responses).toHaveLength(1);
 });
 
 test('file approvals require the actual proposed diff', async () => {
-  const { bridge, store } = fixture();
+  const { bridge, codex, store } = fixture();
   const packet = { id: 7, method: 'item/fileChange/requestApproval', params: { threadId: 't1', turnId: 'turn1', itemId: 'patch' } };
   await bridge.serverRequest(packet);
   expect(approvalDelivery(store.pendingApprovals()[0]!).buttons).toEqual([]);
+  await expect(bridge.decide(store.pendingApprovals()[0]!.token, 'accept', 'c1', 'alice')).rejects.toThrow('not offered');
+  expect(codex.responses).toHaveLength(0);
   store.saveItem('t1', { id: 'patch', type: 'fileChange', changes: [{ path: '/work/a', diff: '+hello' }] });
   await bridge.serverRequest({ ...packet, id: 8 });
   const a = store.pendingApprovals().find(a => a.rpcId === '8')!;
   expect(approvalDelivery(a).content).toContain('+hello');
   expect(approvalDelivery(a).buttons).toHaveLength(3);
+});
+
+test('command approval controls and authorization honor restricted and structured daemon choices', async () => {
+  const { bridge, codex, store } = fixture();
+  await bridge.serverRequest({ ...approval(10), params: { ...approval().params, availableDecisions: ['decline', { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['git'] } }] } });
+  const restricted = store.pendingApprovals()[0]!;
+  expect(approvalDelivery(restricted).buttons?.map(b => b.label)).toEqual(['Decline']);
+  await expect(bridge.decide(restricted.token, 'accept', 'c1', 'alice')).rejects.toThrow('not offered');
+  await expect(bridge.decide(restricted.token, 'cancel', 'c1', 'alice')).rejects.toThrow('not offered');
+  await bridge.decide(restricted.token, 'decline', 'c1', 'alice');
+  expect(codex.responses).toEqual([{ id: 10, result: { decision: 'decline' } }]);
 });
 
 test('persisted outbox survives restart and a failed send does not reorder a channel', async () => {
