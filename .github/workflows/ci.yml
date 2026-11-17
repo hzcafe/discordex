@@ -43,7 +43,9 @@ jobs:
         if: github.event_name == 'push'
         with:
           name: discordex-${{ matrix.target }}
-          path: dist/releases/discordex-${{ matrix.target }}.tar.gz
+          path: |
+            dist/releases/discordex-${{ matrix.target }}
+            dist/releases/discordex-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
@@ -69,7 +71,8 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          files=(discordex-{linux,darwin}-{x64,arm64}.tar.gz)
+          binaries=(discordex-{linux,darwin}-{x64,arm64})
+          files=("${binaries[@]}" "${binaries[@]/%/.tar.gz}")
           sha256sum "${files[@]}" > SHA256SUMS
           tag="build-${GITHUB_SHA:0:12}"
           # Re-running a push may find a complete release or a draft left during upload.
@@ -78,7 +81,7 @@ jobs:
           else
             gh release create "$tag" --target "$GITHUB_SHA" --draft \
               --title "Discordex ${GITHUB_SHA:0:12}" \
-              --notes "Linux and macOS packages for commit $GITHUB_SHA. Extract the archive for your OS and CPU, then run ./discordex doctor from your configured directory."
+              --notes "Download the executable for your OS and CPU, save it as discordex, and run chmod +x discordex. Then run ./discordex doctor from your configured directory. The .tar.gz downloads also include example configuration and documentation."
           fi
           gh release upload "$tag" "${files[@]}" SHA256SUMS --clobber
           latest=false

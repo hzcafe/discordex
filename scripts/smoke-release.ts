@@ -1,15 +1,18 @@
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { copyFile, mkdtemp, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const name = `discordex-${process.platform}-${process.arch}`;
-const archive = resolve('dist/releases', name + '.tar.gz');
+const binary = resolve('dist/releases', name);
 const temp = await mkdtemp(join(tmpdir(), 'dx-'));
 // macOS temporary directory paths can exceed the Unix socket path limit.
 const socketDir = await mkdtemp('/tmp/dx-sock-');
 const socket = join(socketDir, 'peer');
 try {
-  await Bun.$`tar -xzf ${archive} -C ${temp}`;
+  // Install the standalone download by itself, renamed as in the README.
+  const standalone = join(temp, 'discordex');
+  await copyFile(binary, standalone);
+  await Bun.$`tar -xzf ${binary + '.tar.gz'} -C ${temp}`;
   const cwd = join(temp, 'project');
   await mkdir(cwd);
   const id = '100000000000000000';
@@ -29,12 +32,14 @@ try {
     },
   });
   try {
-    const output = await Bun.$`${join(temp, name, 'discordex')} doctor`.cwd(cwd)
-      .env({ PATH: '/usr/bin:/bin', HOME: cwd }).json();
-    if (output.codex !== 'connected' || output.loadedSessions !== 1 || !output.config || !output.discordTokenConfigured) {
-      throw new Error('Packaged doctor could not read the config, dotenv file, and test daemon');
+    for (const executable of [standalone, join(temp, name, 'discordex')]) {
+      const output = await Bun.$`${executable} doctor`.cwd(cwd)
+        .env({ PATH: '/usr/bin:/bin', HOME: cwd }).json();
+      if (output.codex !== 'connected' || output.loadedSessions !== 1 || !output.config || !output.discordTokenConfigured) {
+        throw new Error(`doctor failed for ${executable}`);
+      }
     }
-    console.log(`Verified ${name} from an extracted release archive`);
+    console.log(`Verified standalone and archived executables for ${name}`);
   } finally { await peer.stop(true); }
 } finally {
   await rm(temp, { recursive: true, force: true });

@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { copyFile, cp, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -13,40 +13,36 @@ if (process.argv[2] && process.argv[2] !== target) {
 const name = `discordex-${target}`;
 const temp = await mkdtemp(join(tmpdir(), 'discordex-release-'));
 const directory = join(temp, name);
+const outputDir = resolve('dist/releases');
 try {
   await mkdir(directory);
-  // sharp needs its addon and libvips together on disk. Resolve them from
-  // beside the installed executable, even when launched from a project folder.
+  await mkdir(outputDir, { recursive: true });
+  const binary = join(outputDir, name);
   await Bun.build({
     entrypoints: ['src/cli.ts'],
     target: 'bun',
-    compile: { outfile: join(directory, 'discordex'), autoloadDotenv: true },
+    compile: {
+      outfile: binary,
+      autoloadDotenv: true,
+      assets: [`node_modules/@img/sharp-${target}`, `node_modules/@img/sharp-libvips-${target}`],
+    },
     plugins: [{
       name: 'packaged-sharp',
       setup(build) {
-        build.onLoad({ filter: /[/\\]sharp[/\\]lib[/\\]sharp\.js$/ }, () => ({
+        build.onLoad({ filter: /[/\\]sharp[/\\]lib[/\\]sharp\.js$/ }, async () => ({
           loader: 'js',
-          contents: `
-            const { dirname, join } = require('node:path');
-            process.dlopen(module, join(dirname(process.execPath), 'lib', 'sharp-${target}', 'lib', 'sharp-${target}.node'));
-            if (process.platform === 'linux' && process.arch === 'x64' && !module.exports._isUsingX64V2()) {
-              throw new Error('sharp requires a CPU with x86-64-v2 support');
-            }
-          `,
+          contents: await Bun.file(new URL('./packaged-sharp.cjs', import.meta.url)).text(),
         }));
       },
     }],
   });
-  for (const pkg of [`sharp-${target}`, `sharp-libvips-${target}`]) {
-    await cp(`node_modules/@img/${pkg}`, join(directory, 'lib', pkg), { recursive: true, dereference: true });
-  }
+  await copyFile(binary, join(directory, 'discordex'));
   for (const file of ['README.md', 'docs', '.env.example', 'discordex.config.example.json']) {
     await cp(file, join(directory, file), { recursive: true });
   }
-  await mkdir('dist/releases', { recursive: true });
-  const archive = resolve('dist/releases', name + '.tar.gz');
+  const archive = join(outputDir, name + '.tar.gz');
   await Bun.$`tar -czf ${archive} -C ${temp} ${name}`;
-  console.log(archive);
+  console.log(binary, archive);
 } finally {
   await rm(temp, { recursive: true, force: true });
 }

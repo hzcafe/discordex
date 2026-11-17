@@ -69,7 +69,16 @@ You need **Codex 0.169.0** with its shared app-server daemon, and a Discord serv
 
 ### 2. Install and configure
 
-Prebuilt archives for Linux (glibc) and macOS include the Bun runtime, native image libraries, and example configuration. Download the x64 or ARM64 archive for your host, extract it, and keep the executable and its `lib/` directory together. In the extracted directory, copy `.env.example` to `.env` and `discordex.config.example.json` to `discordex.config.json`. For step 3, use `./discordex doctor` and `./discordex start`. The shared Codex daemon must be installed separately. Automatic uploads of referenced project files currently require Linux’s `/proc/self/fd` checks. [Download a release](https://github.com/hzcafe/discordex/releases)
+**Download a standalone executable** for your host. Each includes Bun and the native image libraries.
+
+| Platform | x64 | ARM64 |
+| --- | --- | --- |
+| Linux (glibc) | [Linux x64](https://github.com/hzcafe/discordex/releases/latest/download/discordex-linux-x64) | [Linux ARM64](https://github.com/hzcafe/discordex/releases/latest/download/discordex-linux-arm64) |
+| macOS | [Intel](https://github.com/hzcafe/discordex/releases/latest/download/discordex-darwin-x64) | [Apple silicon](https://github.com/hzcafe/discordex/releases/latest/download/discordex-darwin-arm64) |
+
+Save the download as `discordex` and run `chmod +x discordex`. Create `.env` and `discordex.config.json` in your working directory using the examples below. The compressed archives include the same executable, both configuration templates, and the docs. [All release assets and checksums](https://github.com/hzcafe/discordex/releases/latest)
+
+The shared Codex daemon is installed separately. Automatic uploads of referenced project files currently require Linux’s `/proc/self/fd` checks.
 
 To run from source with Bun:
 
@@ -107,9 +116,11 @@ Add friends to `allowedUserIds` to let them send instructions. Add people who ma
 
 ```sh
 codex app-server daemon start
-bun run doctor
-bun start
+./discordex doctor
+./discordex start
 ```
+
+For a source install, use `bun run doctor` and `bun start` for the last two commands.
 
 Open or keep a Codex session running on the shared daemon in a configured project. The bot registers `/codex` in your server and creates a Discord thread for each eligible top-level conversation. **Send a message in that thread to give Codex work.** An inbox reaction confirms the message was recorded.
 
@@ -195,7 +206,7 @@ bun test
 bun run build
 ```
 
-Each successful push to the default branch publishes a GitHub Release tagged with the commit ID. Each of the four native runners extracts its archive and runs the packaged `doctor` against a test daemon. Releases include SHA-256 checksums. To build and check an archive for your own host, run `bun run build:release` followed by `bun scripts/smoke-release.ts`.
+Each successful push to the default branch publishes a GitHub Release tagged with the commit ID. Each native runner runs both the standalone download and the archived executable against a test daemon using `doctor`. Releases include SHA-256 checksums for all eight downloads. To build and verify both formats for your host, run `bun run build:release` followed by `bun scripts/smoke-release.ts`.
 
 Use `bun dev` for watch mode. The build produces a Bun-targeted entry point in `dist/`; production can also run the TypeScript source directly. **Node.js is not a runtime dependency.**
 
