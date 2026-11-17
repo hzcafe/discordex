@@ -5,6 +5,15 @@
   "approverUserIds": ["YOUR_DISCORD_USER_ID"],
   "autoDiscover": true,
   "projectRoots": ["/absolute/path/to/your/project"],
+  "inbound": {
+    "maxFiles": 4,
+    "maxFileBytes": 33554432,
+    "maxTotalBytes": 67108864,
+    "cacheBytes": 536870912,
+    "maxCachedFiles": 4096,
+    "retentionDays": 7,
+    "concurrency": 2
+  },
   "artifacts": {
     "enabled": true,
     "roots": [],

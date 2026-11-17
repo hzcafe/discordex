@@ -34,8 +34,10 @@ Built with **Bun, TypeScript, and SQLite**, the bridge consumes structured Codex
 | Feature | What you get |
 | --- | --- |
 | **Coding agents on your phone** | Send work, steer an active turn, or stop it from Discord while Codex runs on your dev box. |
-| **A thread for every session** | Discover loaded Codex sessions within your project roots. Subagents join their parent's Discord thread with distinct labels. |
+| **A thread per conversation** | Each eligible top-level session on the shared daemon gets its own Discord thread. Subagents post in their parent's thread with distinct labels. |
 | **Live progress without the flood** | One compact message per agent turn, edited as work progresses and finalized with the response. Model and effort appear in the footer when available. |
+| **Model and effort controls** | Open a private picker populated from the live daemon catalog. Apply a model and supported reasoning effort to the session's next turns. |
+| **Images, videos, and files** | Send a screenshot or clip from Discord for Codex to inspect. Get supported documents and media referenced in final replies back as Discord attachments. |
 | **Goals you can manage together** | A shared goal card shows the objective, status, elapsed time, and token budget, with controls to create, pause, resume, change the budget, or clear it. |
 | **Approvals where you are** | Buttons for command, file-change, and permission requests; modals for supported input questions. |
 | **Work with friends** | Attributed messages let contributors share a conversation. Separate allowlists decide who can send instructions and who can approve actions. |
@@ -105,7 +107,7 @@ bun run doctor
 bun start
 ```
 
-Open or keep a Codex session running in a configured project. The bot registers `/codex` in your server and creates a Discord thread for each eligible loaded conversation. **Send a message in that thread to give Codex work.** An inbox reaction confirms the message was recorded.
+Open or keep a Codex session running on the shared daemon in a configured project. The bot registers `/codex` in your server and creates a Discord thread for each eligible top-level conversation. **Send a message in that thread to give Codex work.** An inbox reaction confirms the message was recorded.
 
 Initial attachment includes an active turn and future work; it does not copy the entire old conversation. `doctor` checks the local daemon connection without sending prompts or posting to Discord. `start` can launch the default daemon when its socket is missing and leaves it running when Discordex exits.
 
@@ -118,6 +120,7 @@ For an always-on installation, use the [Linux background-service guide](docs/con
 | List eligible loaded sessions | `/codex sessions` |
 | Attach a session explicitly | `/codex attach id:<Codex thread ID>` |
 | Queue work for the next turn | Send a normal message in a linked thread |
+| Share a screenshot, GIF, or video with Codex | Attach it in a linked thread, with or without a caption |
 | Add instructions to work in progress | `/codex steer message:<instructions>` |
 | Interrupt the current turn | `/codex stop` |
 | Inspect connectivity | `/codex status` |
@@ -141,7 +144,7 @@ Temporary upload failures recover automatically on the same message, without hol
 | Guide | Covers |
 | --- | --- |
 | [Configuration and hosting](docs/configuration.md) | Settings, contributor and approver access, Linux service, and troubleshooting |
-| [Automatic file sharing](docs/file-sharing.md) | Referenced documents, inline media, sharing roots, and attachment limits |
+| [File sharing and media](docs/file-sharing.md) | Incoming media formats and retention, outgoing attachments, sharing roots, and size limits |
 | [Architecture](docs/architecture.md) | Bun/TypeScript stack, daemon discovery, editable cards, persistence, and recovery limits |
 | [Development](#development) | Local checks, source map, and protocol updates |
 
@@ -159,13 +162,15 @@ Yes. Add their Discord user IDs to the contributor allowlist. Messages carry the
 
 Yes. Discordex attaches to the shared daemon alongside your local client. It discovers loaded sessions on that daemon within your configured project roots. Sessions using `--no-daemon` or a different daemon are outside its discovery scope.
 
-### Are images and voice supported?
+### What can I send as an attachment?
 
-Final replies can share referenced images and videos as inline media, and documents as downloadable files without text excerpts. See [automatic file sharing](docs/file-sharing.md). Input attachments and voice messages are not ingested; only accompanying text is forwarded.
+Send PNG, JPEG, WebP, GIF, AVIF, MP4, MOV, or WebM files in a linked thread. Discordex saves supported originals on the host so Codex can inspect them with tools. Images can also supply a still preview, including the first frame of an animated GIF. For video, the preview uses a thumbnail when the Discord embed supplies one. For voice messages and other unsupported attachments, Codex receives a link and a format notice.
+
+In the other direction, a final reply can share a referenced image or video inline, or attach a document such as a PDF. By default, Discordex looks for those files in the session's working directory. See [sharing roots, supported formats, and limits](docs/file-sharing.md).
 
 ### Can I see or change the model in Discord?
 
-Yes. Run `/codex model` in a linked thread to open a private model and reasoning-effort picker. The dropdowns use the daemon's available models and each model's supported efforts. Choose both, then **Apply**; the settings affect subsequent turns in that same session. Changing the model preserves your chosen effort when supported, otherwise selecting the new model's default. **Refresh** reloads the current settings and available models.
+Yes. Run `/codex model` in a linked thread to open a private picker. It loads the model names and supported reasoning efforts from the daemon for that session's provider. Choose a model, check the effort, and press **Apply** to use those settings for subsequent turns in the same conversation. **Refresh** reloads the current settings and available models.
 
 Cards display the model and reasoning effort when available. These start from captured session settings; a daemon-reported model reroute updates the turn's label. They are not a per-step execution audit. See [turn cards and model labels](docs/architecture.md#turn-cards-and-model-labels).
 

@@ -1,6 +1,8 @@
 // The subset of the Codex 0.169.0 app-server protocol used by Discordex.
 // Keep wire names aligned with `codex app-server generate-ts --experimental`.
 export type RequestId = string | number;
+// Images are snapshotted as data URLs before a Discord message enters the queue.
+export interface InputImage { type: 'image'; url: string }
 export type JsonObject = Record<string, any>;
 export interface Packet {
   id?: RequestId;

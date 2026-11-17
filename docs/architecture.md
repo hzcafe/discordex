@@ -13,6 +13,7 @@ Discordex is a self-hosted Discord client for the shared local Codex app-server 
 | Discord | `discord.js` 14, Gateway events, REST delivery, and Components V2 cards |
 | Codex transport | `ws` over the local Unix WebSocket socket; app-server requests and notifications |
 | Persistence | `bun:sqlite` with WAL mode |
+| Inbound images | `sharp` raster decoding, metadata removal, and static previews |
 | Deployment | Host process with an optional systemd user service |
 | Validation | Bun tests, TypeScript checks, and Bun build in GitHub Actions |
 
@@ -35,6 +36,8 @@ The connection sees only its shared daemon. Sessions running with `--no-daemon` 
 ## Messages and turns
 
 An allowed user's message in a linked thread is persisted in the inbox and submitted with the sender's identity. The Discord message ID becomes Codex's `clientUserMessageId`, which helps reconcile a submission if the connection fails around acceptance.
+
+Media preparation uses the initial message metadata immediately, outside the bridge queue. A bounded resource pool permits independent channels to prepare media concurrently; ordinary text bypasses the pool. Original files are saved before optional still previews, and durable source references reuse earlier originals across retries. Codex receives usable local paths plus any native image previews. Retention extends through consumption and active tool use. Preview failures and preview-capacity pressure do not discard usable originals. See [inbound media](file-sharing.md#media-sent-from-discord).
 
 Normal messages queue work. `/codex steer` adds instructions to the active turn, and `/codex stop` interrupts it. The index channel is not forwarded; bots and webhooks are ignored.
 
@@ -74,7 +77,7 @@ Codex is authoritative for conversation history and pending requests. Discordex 
 
 Discord's nonce deduplication window is finite. A crash after Discord accepted a message but before its ID was saved can still cause a duplicate after a sufficiently long outage. There is no exactly-once guarantee across the two services.
 
-Uncertain incoming submissions are reconciled against the daemon queue and history; they are not blindly replayed. Ordinary messages received while disconnected stay in the local inbox. The adapter recovers available missed Discord messages, but deleted or unavailable messages cannot be recovered.
+Uncertain incoming submissions are reconciled against the daemon queue and history; they are not blindly replayed. Ordinary messages received while disconnected stay in the local inbox. The adapter recovers available missed Discord messages independently per channel. A channel remains gated until its buffered backlog has drained; a slow history read does not buffer unrelated channels. Concurrent catch-up callers share the actual recovery promise. Deleted or unavailable messages cannot be recovered.
 
 Reconnects invalidate old approval controls. Only requests replayed by Codex receive fresh controls; resolution in the local client also removes Discord controls. See [approval behavior](configuration.md#approval-behavior) for supported decisions and local-only cases.
 
@@ -100,7 +103,7 @@ The bridge has several separate state machines. Their transitions use daemon evi
 | Codex connection | Only the current socket can dispatch events or change connection state. Stop rejects pending requests immediately; callbacks from retired sockets cannot affect a replacement connection. |
 | CLI lifecycle | Shutdown prevents startup from continuing after asynchronous preparation or login. It waits for in-flight login before closing Discord, drains accepted work, and attempts every cleanup step even if an earlier step fails. |
 
-Attachment-only warning replies have their own durable receipt markers. Concurrent live/history receipts share one reply; failures remain retryable. Shutdown drains pending warning replies before closing SQLite. Live receipt never advances the history cursor past unseen messages. These markers have the same finite nonce-deduplication and retention limits as other deliveries.
+Empty messages without attachments have durable warning receipt markers. Concurrent live/history receipts share preparation or one warning reply; failures remain retryable. Shutdown drains pending input preparations and warning replies before closing SQLite. Live receipt never advances the history cursor past unseen messages. These markers have the same finite nonce-deduplication and retention limits as other deliveries. Pending input preview snapshots survive restart and uncertain acceptance, and are cleared only after confirmed consumption; input IDs remain durable. Original files have independent retention and consuming-turn pins. Inbox draining queries pending inputs only and makes no queue RPCs for an empty inbox. Shutdown and concurrent flush calls await the actual delivery promise rather than polling flags.
 
 ## Shared goal cards
 
@@ -122,6 +125,8 @@ Budget edits omit the objective and status to preserve usage accounting. Creatin
 | [`src/codex.ts`](../src/codex.ts) | Unix WebSocket transport, requests, notifications, heartbeat, and reconnects |
 | [`src/bridge.ts`](../src/bridge.ts) | Discovery, event handling, message routing, approvals, and recovery |
 | [`src/discord.ts`](../src/discord.ts) | Discord Gateway/REST, slash commands, buttons, modals, and message catch-up |
+| [`src/inbound-media.ts`](../src/inbound-media.ts) | Immediate media discovery, original downloads and optional still previews |
+| [`src/inbound-cache.ts`](../src/inbound-cache.ts) | Immutable original files, retry references, retention and bounded resource slots |
 | [`src/turns.ts`](../src/turns.ts) | Durable per-agent turn state and model snapshots |
 | [`src/render.ts`](../src/render.ts) | Logical output and prompt rendering |
 | [`src/approvals.ts`](../src/approvals.ts) | Supported approval actions shared by rendering and decision validation |

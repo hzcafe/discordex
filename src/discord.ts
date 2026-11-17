@@ -11,7 +11,9 @@ import { approvalControls } from './approvals.js';
 import { deliveryFiles, discordPayload, discordEditPayload, prepareDiscordPayload, prepareDiscordEditPayload } from './components.js';
 import { parseGoalControl } from './goals.js';
 import { modelPickerPayload, parseModelControl } from './models.js';
-import { Store } from './store.js';
+import { InputCapacityError, Store } from './store.js';
+import { hasIncomingMedia, type IncomingMedia, MediaRetryError, prepareIncomingMedia } from './inbound-media.js';
+import { InboundMediaCache } from './inbound-cache.js';
 import { discordNotFound, MissingMessageError, MissingThreadError, temporaryUploadFailure } from './chat.js';
 import { artifactUploads } from './artifacts.js';
 import { rejectedReviewNotice, retryingReviewNotice, withoutGeneratedFile } from './uploads.js';
@@ -51,10 +53,14 @@ export class DiscordAdapter implements ChatPort {
   private parent?: TextChannel;
   private bridge?: Bridge;
   private inboxTimer?: ReturnType<typeof setInterval>;
-  private recovering = false;
+  private recovery?: Promise<void>;
   private closed = false;
-  private buffered: Message[] = [];
+  private buffered = new Map<string, Message[]>();
   private nonTextReplies = new Map<string, Promise<void>>();
+  private incoming = new Map<string, Promise<void>>();
+  private channelInputs = new Map<string, Promise<void>>();
+  private mediaCache?: InboundMediaCache;
+  private get media(): InboundMediaCache { return this.mediaCache ??= new InboundMediaCache(this.store, this.config.stateDir, this.config.inbound); }
   constructor(private config: Config, private store: Store) {}
 
   async login(token: string): Promise<void> {
@@ -100,7 +106,8 @@ export class DiscordAdapter implements ChatPort {
   connect(bridge: Bridge): void {
     this.bridge = bridge;
     this.client.on(Events.MessageCreate, msg => {
-      if (this.recovering) this.buffered.push(msg);
+      const buffer = this.buffered.get(msg.channelId);
+      if (buffer) buffer.push(msg);
       else void this.receive(msg).catch(error => console.error(`Discord input: ${error}`));
     });
     this.client.on(Events.InteractionCreate, interaction => { void this.interact(interaction).catch(error => console.error(`Discord interaction: ${error}`)); });
@@ -112,12 +119,18 @@ export class DiscordAdapter implements ChatPort {
     void this.catchUp();
     this.inboxTimer = setInterval(() => { void this.catchUp(); }, 30_000);
   }
-  async catchUp(): Promise<void> {
-    if (this.recovering || this.closed || !this.bridge) return;
-    this.recovering = true;
+  catchUp(): Promise<void> {
+    if (this.recovery) return this.recovery;
+    if (this.closed || !this.bridge) return Promise.resolve();
+    this.recovery = this.recoverInbox().finally(() => { this.recovery = undefined; });
+    return this.recovery;
+  }
+  private async recoverInbox(): Promise<void> {
     try {
-      for (const binding of this.store.bindings().filter(b => !b.parentThreadId)) {
-        if (!this.bridge.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) continue;
+      const results = await Promise.allSettled(this.store.bindings().filter(b => !b.parentThreadId).map(async binding => {
+        if (!this.bridge!.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) return;
+        const buffer: Message[] = [];
+        this.buffered.set(binding.channelId, buffer);
         try {
           const key = `inbox-cursor:${binding.channelId}`;
           // A Discord thread's snowflake is a natural lower boundary for its messages.
@@ -135,24 +148,47 @@ export class DiscordAdapter implements ChatPort {
           }
         } catch (error) {
           if (!this.closed && error instanceof MissingThreadError) {
-            await this.bridge.serial(() => this.bridge!.recoverChannel(binding.channelId))
+            await this.bridge!.serial(() => this.bridge!.recoverChannel(binding.channelId))
               .catch(error => console.error(`Discord thread recovery for ${binding.channelId}: ${error}`));
           } else console.error(`Discord history recovery for ${binding.channelId}: ${error}`);
+        } finally {
+          // Keep this channel gated until its whole backlog is drained; other
+          // channels can deliver while this one's history/download is pending.
+          while (!this.closed && buffer.length) await this.receive(buffer.shift()!).catch(error => console.error(`Discord input: ${error}`));
+          this.buffered.delete(binding.channelId);
         }
-      }
+      }));
+      for (const result of results) if (result.status === 'rejected') console.error(`Discord history recovery: ${result.reason}`);
     } catch (error) { console.error(`Discord history recovery: ${error}`); }
-    finally {
-      this.recovering = false;
-      for (const msg of this.buffered.splice(0)) {
-        if (this.closed) break;
-        await this.receive(msg).catch(error => console.error(`Discord input: ${error}`));
-      }
-    }
   }
-  private async receive(msg: Message): Promise<void> {
-    if (this.closed || !this.bridge || msg.guildId !== this.config.guildId || msg.author.bot || msg.webhookId || !this.store.byChannel(msg.channelId)) return;
-    if (!this.config.allowedUserIds.includes(msg.author.id)) return;
-    if (!msg.content.trim()) {
+  private receive(msg: Message): Promise<void> {
+    if (this.closed || !this.bridge || msg.guildId !== this.config.guildId || msg.author.bot || msg.webhookId) return Promise.resolve();
+    const binding = this.store.byChannel(msg.channelId);
+    if (!binding || !this.config.allowedUserIds.includes(msg.author.id)) return Promise.resolve();
+    if (this.bridge.eligible && !this.bridge.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) return Promise.resolve();
+    if (this.store.hasInput(msg.id)) {
+      // A crash after saving the input but before updating its status must not
+      // leave a permanent "waiting for images" notice on history recovery.
+      this.mediaReceived(msg.id);
+      return Promise.resolve();
+    }
+    const existing = this.incoming.get(msg.id);
+    if (existing) return existing;
+    const prior = this.channelInputs.get(msg.channelId);
+    const work = prior ? prior.catch(() => {}).then(() => this.receiveInput(msg)) : this.receiveInput(msg);
+    const pending = work.finally(() => {
+      this.incoming.delete(msg.id);
+      if (this.channelInputs.get(msg.channelId) === pending) this.channelInputs.delete(msg.channelId);
+    });
+    this.incoming.set(msg.id, pending);
+    this.channelInputs.set(msg.channelId, pending);
+    return pending;
+  }
+  private mediaReceived(id: string): void {
+    this.store.revise(`input-media-retry:${id}`, card('The message is saved for Codex. Any unavailable media is identified in the forwarded message.', { title: 'Message received' }));
+  }
+  private async receiveInput(msg: Message): Promise<void> {
+    if (!msg.content.trim() && !msg.attachments?.size && !msg.embeds?.length) {
       // Unlike text submissions, warnings have no input row to deduplicate them.
       // Share in-flight replies and persist success without moving the history cursor.
       const key = `non-text-reply:${msg.id}`;
@@ -160,7 +196,7 @@ export class DiscordAdapter implements ChatPort {
       let pending = this.nonTextReplies.get(msg.id);
       if (!pending) {
         pending = Promise.resolve().then(async () => {
-          await msg.reply({ content: 'This version forwards text messages. Add text describing the attachment or task.',
+          await msg.reply({ content: 'This message has no text or supported image attachment to forward.',
             nonce: deliveryNonce(key), enforceNonce: true, allowedMentions: { parse: [], repliedUser: false } });
           this.store.setMeta(key, 'sent');
         }).finally(() => { this.nonTextReplies.delete(msg.id); });
@@ -170,9 +206,36 @@ export class DiscordAdapter implements ChatPort {
       return;
     }
     try {
-      const result = await this.bridge.serial(() => this.bridge!.submit(msg.channelId, msg.id, msg.author.id, msg.member?.displayName ?? msg.author.username, msg.content));
-      if (result !== 'Already received') await msg.react(result.startsWith('Submission') ? '⚠️' : '📥');
+      // Media work is bounded and runs outside the bridge queue, so downloads do
+      // not hold up approval decisions or Codex events.
+      const media: IncomingMedia = hasIncomingMedia(msg)
+        ? await this.media.run(() => prepareIncomingMedia(msg, fetch, { cache: this.media, inputId: msg.id }))
+        : { images: [], notes: [], warnings: [] };
+      const text = () => [msg.content, ...(media.notes.length ? [`[Discord media]\n${media.notes.join('\n')}`] : [])].filter(Boolean).join('\n\n');
+      if (!text().trim() && !media.images.length) return;
+      const result = await this.bridge!.serial(async () => {
+        const submit = () => this.bridge!.submit(msg.channelId, msg.id, msg.author.id,
+          msg.member?.displayName ?? msg.author.username, text(), media.images);
+        try { return await submit(); }
+        catch (error) {
+          if (!(error instanceof InputCapacityError) || !media.originals?.length) throw error;
+          media.images = [];
+          media.notes = media.notes.filter(note => !/^Image \d+:/.test(note));
+          const warning = 'Image preview storage is full; the saved original files are available for analysis.';
+          media.notes.push(warning); media.warnings.push(warning);
+          return await submit();
+        }
+      });
+      this.mediaReceived(msg.id);
+      if (media.warnings.length) this.store.enqueue(`input-media-notes:${msg.id}`, msg.channelId,
+        card(`Some media or previews were unavailable. Codex received the details, saved file paths, and available links.\n\n${media.warnings.join('\n')}`, { title: 'Media input', tone: 'warning' }));
+      if (result !== 'Already received') await msg.react(result.startsWith('Submission') || media.warnings.length ? '⚠️' : '📥');
     } catch (error) {
+      if (error instanceof MediaRetryError || error instanceof InputCapacityError) {
+        this.store.enqueue(`input-media-retry:${msg.id}`, msg.channelId,
+          card('This message is waiting for its media. Discordex will retry automatically; you do not need to resend it.', { title: 'Media delayed', tone: 'warning' }));
+        throw error; // Leave the history cursor before this message for automatic retry.
+      }
       await msg.reply({ content: compact(String(error)), allowedMentions: { parse: [], repliedUser: false } });
       throw error;
     }
@@ -432,7 +495,8 @@ export class DiscordAdapter implements ChatPort {
   }
   async close(): Promise<void> {
     this.closed = true; clearInterval(this.inboxTimer);
-    while (this.recovering) await Bun.sleep(25);
+    await this.recovery;
+    await Promise.allSettled(this.incoming.values());
     await Promise.allSettled(this.nonTextReplies.values());
     await this.client.destroy();
   }

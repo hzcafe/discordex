@@ -19,6 +19,7 @@ Start from [`discordex.config.example.json`](../discordex.config.example.json) a
 | `projectRoots` | `[]` allows all projects. Otherwise, use absolute roots; descendants are included |
 | `socketPath` | `$CODEX_HOME/app-server-control/app-server-control.sock`, with `CODEX_HOME` defaulting to `~/.codex` |
 | `stateDir` | `$XDG_STATE_HOME/discordex`, with `XDG_STATE_HOME` defaulting to `~/.local/state` |
+| `inbound` | Original-media download/cache limits, retention and preparation concurrency; see [inbound media](file-sharing.md#media-sent-from-discord) |
 | `artifacts` | Automatic document/media sharing, enabled by default; see [file sharing](file-sharing.md) for roots, upload limits, and cache retention |
 
 If supplied, `socketPath` and `stateDir` must be absolute paths. Legacy `verbosity` settings are ignored; there are no verbosity modes.
@@ -44,7 +45,7 @@ Discord channel membership controls **read access**. The bot's allowlists do not
 
 Output, commands, and diffs are sent to Discord and stored locally for delivery. Self-hosting the bridge does not keep exported content off Discord. Keep `.env` and `discordex.config.json` out of version control; both are gitignored.
 
-Every allowed user's text in a linked thread is forwarded to Codex, including discussion between friends. Messages in the index channel, bot messages, and webhook messages are not forwarded. Attachments and voice messages are not ingested; accompanying text is forwarded as text only.
+Every allowed user's text in a linked thread is forwarded to Codex, including discussion between friends. Messages in the index channel, bot messages, and webhook messages are not forwarded. Supported image and video originals are saved for Codex tool use, with optional still previews. Other files and voice attachments retain links with an unsupported-format notice.
 
 ## Approval behavior
 

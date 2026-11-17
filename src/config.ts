@@ -15,6 +15,20 @@ export const defaultArtifacts: ArtifactConfig = {
   maxTotalBytes: 16 * 1024 * 1024, cacheBytes: 128 * 1024 * 1024, retentionDays: 7,
 };
 
+export interface InboundConfig {
+  maxFiles: number;
+  maxFileBytes: number;
+  maxTotalBytes: number;
+  cacheBytes: number;
+  retentionDays: number;
+  concurrency: number;
+  maxCachedFiles: number;
+}
+export const defaultInbound: InboundConfig = {
+  maxFiles: 4, maxFileBytes: 32 * 1024 * 1024, maxTotalBytes: 64 * 1024 * 1024,
+  cacheBytes: 512 * 1024 * 1024, retentionDays: 7, concurrency: 2, maxCachedFiles: 4096,
+};
+
 export interface Config {
   guildId: string;
   channelId: string;
@@ -25,6 +39,7 @@ export interface Config {
   socketPath: string;
   stateDir: string;
   artifacts?: ArtifactConfig;
+  inbound?: InboundConfig;
 }
 export function defaultSocket(): string {
   return join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'app-server-control/app-server-control.sock');
@@ -68,7 +83,19 @@ export async function readConfig(path = process.env.DISCORDEX_CONFIG || 'discord
   if (artifacts.maxFileBytes > artifacts.maxTotalBytes || artifacts.maxTotalBytes > artifacts.cacheBytes) {
     throw new Error('Artifact limits must satisfy maxFileBytes <= maxTotalBytes <= cacheBytes');
   }
+  const suppliedInbound = value.inbound ?? {};
+  if (typeof suppliedInbound !== 'object' || Array.isArray(suppliedInbound)) throw new Error('inbound must be an object');
+  const inbound: InboundConfig = { ...defaultInbound, ...suppliedInbound };
+  const inboundMaxima = { maxFiles: 8, maxFileBytes: 128 * 1024 * 1024, maxTotalBytes: 256 * 1024 * 1024,
+    cacheBytes: 4 * 1024 * 1024 * 1024, retentionDays: 365, concurrency: 8, maxCachedFiles: 65536 };
+  for (const [key, max] of Object.entries(inboundMaxima)) {
+    const v = inbound[key as keyof InboundConfig];
+    if (!Number.isSafeInteger(v) || v < 1 || v > max) throw new Error(`inbound.${key} must be a whole number from 1 to ${max}`);
+  }
+  if (inbound.maxFileBytes > inbound.maxTotalBytes || inbound.maxTotalBytes > inbound.cacheBytes) {
+    throw new Error('Inbound limits must satisfy maxFileBytes <= maxTotalBytes <= cacheBytes');
+  }
   return { guildId: value.guildId, channelId: value.channelId, allowedUserIds: value.allowedUserIds,
     approverUserIds: value.approverUserIds, autoDiscover: value.autoDiscover ?? true,
-    projectRoots: projectRoots.map((p: string) => resolve(p)), socketPath, stateDir, artifacts };
+    projectRoots: projectRoots.map((p: string) => resolve(p)), socketPath, stateDir, artifacts, inbound };
 }

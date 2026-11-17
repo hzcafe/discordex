@@ -48,3 +48,14 @@ test('file sharing has its own roots and bounded configurable upload/cache limit
     await expect(readConfig(path)).rejects.toThrow();
   }
 });
+
+test('original media has independent validated size, retention and concurrency limits', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-config-')); dirs.push(dir);
+  const path = join(dir, 'config.json');
+  const base = { guildId: '100000000000000001', channelId: '100000000000000002', allowedUserIds: ['100000000000000003'], approverUserIds: ['100000000000000003'] };
+  await Bun.write(path, JSON.stringify(base));
+  expect((await readConfig(path)).inbound).toMatchObject({ maxFiles: 4, concurrency: 2, retentionDays: 7, maxCachedFiles: 4096 });
+  for (const inbound of [{ concurrency: 0 }, { maxFiles: 9 }, { cacheBytes: 1 }, { maxTotalBytes: 1 }, { retentionDays: 0 }, { maxCachedFiles: 0 }]) {
+    await Bun.write(path, JSON.stringify({ ...base, inbound })); await expect(readConfig(path)).rejects.toThrow();
+  }
+});

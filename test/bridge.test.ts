@@ -304,6 +304,28 @@ test('attach repairs a deleted thread again after replacement; access failures a
   expect(chat.created).toHaveLength(2);
 });
 
+test('concurrent flushes and shutdown await the in-flight Discord receipt', async () => {
+  const { bridge, chat, store } = fixture();
+  store.enqueue('pending', 'c1', message('Send once'));
+  let accept!: (id: string) => void;
+  const receipt = new Promise<string>(resolve => { accept = resolve; });
+  let sends = 0;
+  chat.send = async () => { sends++; return receipt; };
+  const first = bridge.flush();
+  const concurrent = bridge.flush();
+  let stopped = false;
+  const stopping = bridge.stop().then(() => { stopped = true; });
+  try {
+    expect(concurrent).toBe(first);
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    expect(store.messageId('pending')).toBeNull();
+  } finally { accept('discord-receipt'); }
+  await Promise.all([first, concurrent, stopping]);
+  expect(sends).toBe(1);
+  expect(store.messageId('pending')).toBe('discord-receipt');
+});
+
 test('delivery-triggered recovery cannot deadlock a serial flush and keeps retrying a failed creation', async () => {
   const { bridge, chat, store } = fixture();
   store.enqueue('reply', 'c1', { content: 'Pending reply' });
@@ -477,6 +499,14 @@ test('history before first attachment is not exported, but an already-active tur
   expect(chat.sent[0]!.delivery.content).toContain('current');
 });
 
+test('an inbox containing only delivered inputs requires no thread or queue reads to drain', async () => {
+  const { bridge, codex, store } = fixture();
+  store.addInput('consumed', 't1', 'Already seen');
+  store.inputState('consumed', 'delivered');
+  await bridge.sync();
+  expect(codex.calls.some(c => c.method === 'thread/read' || c.method.startsWith('thread/queue/'))).toBe(false);
+});
+
 test('concurrent friends are queued in order with attribution and duplicate Discord IDs are ignored', async () => {
   const { bridge, codex } = fixture();
   await Promise.all([
@@ -489,6 +519,25 @@ test('concurrent friends are queued in order with attribution and duplicate Disc
   expect(adds[1]!.params.input[0].text).toContain('Bob; user ID: bob');
   expect(codex.calls.filter(c => c.method === 'thread/queue/start')).toHaveLength(1);
   expect(codex.calls.some(c => c.method === 'turn/steer')).toBe(false);
+});
+
+test('queued images use the native protocol and uncertain acceptance retains the snapshot without duplicate submission', async () => {
+  const { bridge, codex, store } = fixture();
+  const images = [{ type: 'image' as const, url: 'data:image/png;base64,c25hcHNob3Q=' }];
+  codex.failAdd = true;
+  codex.thread.status = { type: 'active' };
+  await bridge.submit('c1', 'image1', 'alice', 'Alice', '', images);
+  expect(JSON.parse(store.inputs()[0]!.images)).toEqual(images);
+  expect(store.inputs()[0]!.state).toBe('unknown');
+  codex.failAdd = false;
+  await bridge.sync();
+  const adds = codex.calls.filter(c => c.method === 'thread/queue/add');
+  expect(adds).toHaveLength(1); expect(adds[0]!.params.input[1]).toEqual(images[0]);
+  expect(store.inputs()[0]!.state).toBe('queued');
+  expect(JSON.parse(store.inputs()[0]!.images)).toEqual(images);
+  await bridge.notification({ method: 'item/started', params: { threadId: 't1', turnId: 'turn1', item: { id: 'u1', type: 'userMessage', clientId: 'image1' } } });
+  expect(store.inputs()[0]!.state).toBe('delivered'); expect(store.inputs()[0]!.images).toBe('[]');
+  expect(await bridge.submit('c1', 'image1', 'alice', 'Alice', '', images)).toBe('Already received');
 });
 
 test('uncertain submission is reconciled by client ID instead of duplicated', async () => {

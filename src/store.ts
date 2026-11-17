@@ -1,14 +1,18 @@
 import { Database } from 'bun:sqlite';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Binding, Delivery, GoalCardState, Item, Packet, TokenUsageSnapshot, TurnState } from './types.js';
+import type { Binding, Delivery, GoalCardState, InputImage, Item, Packet, TokenUsageSnapshot, TurnState } from './types.js';
 
 export interface Outgoing { key: string; channel: string; payload: string; message: string | null; attempts: number; revision: number; generation: number; partial: number }
 export type ApprovalState = 'pending' | 'submitted' | 'uncertain' | 'resolved' | 'expired';
 export type InputState = 'new' | 'submitting' | 'unknown' | 'queued' | 'delivered';
 export interface Approval { token: string; epoch: string; rpcId: string; threadId: string; channel: string; packet: string; state: ApprovalState;
   reviewDelivery?: 'pending' | 'ready' | 'unavailable' }
-export interface Input { id: string; threadId: string; text: string; state: InputState; queueId: string | null }
+export interface Input { id: string; threadId: string; text: string; images: string; state: InputState; queueId: string | null }
+
+export class InputCapacityError extends Error {
+  constructor() { super('Pending image storage is full'); }
+}
 
 export class Store {
   readonly db: Database;
@@ -36,17 +40,24 @@ export class Store {
         id TEXT PRIMARY KEY, threadId TEXT NOT NULL, text TEXT NOT NULL,
         state TEXT NOT NULL DEFAULT 'new', queueId TEXT
       );
+      CREATE INDEX IF NOT EXISTS inputs_pending ON inputs(threadId) WHERE state != 'delivered';
       CREATE TABLE IF NOT EXISTS items (threadId TEXT, itemId TEXT, json TEXT, PRIMARY KEY(threadId, itemId));
       CREATE TABLE IF NOT EXISTS turn_cards (threadId TEXT, turnId TEXT, json TEXT NOT NULL, PRIMARY KEY(threadId, turnId));
       CREATE TABLE IF NOT EXISTS artifact_results (id TEXT PRIMARY KEY, deliveryKey TEXT NOT NULL, hash TEXT, json TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS artifact_result_delivery ON artifact_results(deliveryKey);
       CREATE TABLE IF NOT EXISTS artifact_blobs (hash TEXT PRIMARY KEY, content BLOB NOT NULL, touchedAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS inbound_media (hash TEXT PRIMARY KEY, extension TEXT NOT NULL, bytes INTEGER NOT NULL, retainedAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS inbound_media_refs (inputId TEXT, sourceKey TEXT, hash TEXT NOT NULL, turnId TEXT,
+        PRIMARY KEY(inputId, sourceKey));
+      CREATE INDEX IF NOT EXISTS inbound_media_retention ON inbound_media(retainedAt);
+      CREATE INDEX IF NOT EXISTS inbound_media_refs_hash ON inbound_media_refs(hash);
     `);
     this.db.transaction(() => {
       const additions = [
         ['outbox', 'generation', 'INTEGER NOT NULL DEFAULT 0'], ['outbox', 'blocked', 'INTEGER NOT NULL DEFAULT 0'],
         ['outbox', 'failure', 'TEXT'], ['approvals', 'reviewDelivery', "TEXT NOT NULL DEFAULT 'pending'"],
         ['outbox', 'partial', 'INTEGER NOT NULL DEFAULT 0'],
+        ['inputs', 'images', "TEXT NOT NULL DEFAULT '[]'"],
       ];
       for (const [table, column, definition] of additions) {
         if (!this.db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().some(c => c.name === column)) {
@@ -242,8 +253,23 @@ export class Store {
   resolveApproval(epoch: string, rpcId: unknown): Approval | undefined {
     return this.db.query<Approval, [string, string]>('SELECT * FROM approvals WHERE epoch = ? AND rpcId = ?').get(epoch, JSON.stringify(rpcId)) ?? undefined;
   }
-  addInput(id: string, threadId: string, text: string): boolean {
-    return this.db.query('INSERT OR IGNORE INTO inputs (id, threadId, text) VALUES (?, ?, ?)').run(id, threadId, text).changes > 0;
+  hasInput(id: string): boolean { return Boolean(this.db.query('SELECT 1 FROM inputs WHERE id = ?').get(id)); }
+  input(id: string): Input | undefined { return this.db.query<Input, [string]>('SELECT * FROM inputs WHERE id = ?').get(id) ?? undefined; }
+  pendingInputs(threadId?: string): Input[] {
+    return threadId
+      ? this.db.query<Input, [string]>("SELECT * FROM inputs WHERE threadId = ? AND state != 'delivered' ORDER BY rowid").all(threadId)
+      : this.db.query<Input, []>("SELECT * FROM inputs WHERE state != 'delivered' ORDER BY rowid").all();
+  }
+  addInput(id: string, threadId: string, text: string, images: InputImage[] = []): boolean {
+    return this.db.transaction(() => {
+      if (this.hasInput(id)) return false;
+      const encoded = JSON.stringify(images);
+      if (images.length) {
+        const used = this.db.query<{ bytes: number }, []>('SELECT COALESCE(SUM(length(images)), 0) AS bytes FROM inputs WHERE images != \'[]\'').get()!.bytes;
+        if (used + encoded.length > 128 * 1024 * 1024) throw new InputCapacityError();
+      }
+      return this.db.query('INSERT INTO inputs (id, threadId, text, images) VALUES (?, ?, ?, ?)').run(id, threadId, text, encoded).changes > 0;
+    })();
   }
   inputs(threadId?: string): Input[] {
     return threadId
@@ -251,7 +277,16 @@ export class Store {
       : this.db.query<Input, []>('SELECT * FROM inputs ORDER BY rowid').all();
   }
   inputState(id: string, state: InputState, queueId: string | null = null): void {
-    this.db.query('UPDATE inputs SET state = ?, queueId = COALESCE(?, queueId) WHERE id = ?').run(state, queueId, id);
+    this.db.transaction(() => {
+      if (state === 'delivered') this.db.query(`UPDATE inbound_media SET retainedAt = ? WHERE hash IN
+        (SELECT hash FROM inbound_media_refs WHERE inputId = ?) AND EXISTS
+        (SELECT 1 FROM inputs WHERE id = ? AND state != 'delivered')`).run(Date.now(), id, id);
+      this.db.query(`UPDATE inputs SET state = ?, queueId = COALESCE(?, queueId),
+        images = CASE WHEN ? = 'delivered' THEN '[]' ELSE images END WHERE id = ?`).run(state, queueId, state, id);
+    })();
+  }
+  bindInputMediaTurn(id: string, turnId: string): void {
+    this.db.query('UPDATE inbound_media_refs SET turnId = COALESCE(turnId, ?) WHERE inputId = ?').run(turnId, id);
   }
   saveItem(threadId: string, item: Item): void { this.db.query('INSERT OR REPLACE INTO items VALUES (?, ?, ?)').run(threadId, item.id, JSON.stringify(item)); }
   item(threadId: string, itemId: string): Item | undefined {

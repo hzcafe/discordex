@@ -6,6 +6,28 @@ import { join } from 'node:path';
 import { Store } from '../src/store.js';
 import { approvalDelivery } from '../src/render.js';
 
+test('legacy text inputs migrate and pending image snapshots survive restart until confirmed consumption', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-inbound-migration-'));
+  const path = join(dir, 'state.sqlite');
+  const old = new Database(path);
+  old.exec("CREATE TABLE inputs (id TEXT PRIMARY KEY, threadId TEXT NOT NULL, text TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'new', queueId TEXT); INSERT INTO inputs VALUES ('text', 't1', 'Hello', 'delivered', NULL)");
+  old.close();
+  let store = new Store(path);
+  const images = [{ type: 'image' as const, url: 'data:image/png;base64,c25hcHNob3Q=' }];
+  try {
+    expect(store.inputs()[0]!.images).toBe('[]');
+    store.addInput('image', 't1', 'Image', images);
+    store.inputState('image', 'queued', 'q1');
+    store.close(); store = new Store(path);
+    expect(JSON.parse(store.inputs()[1]!.images)).toEqual(images);
+    expect(store.inputs()[1]!.queueId).toBe('q1');
+    expect(store.addInput('image', 't1', 'Changed', [])).toBe(false);
+    expect(JSON.parse(store.inputs()[1]!.images)).toEqual(images);
+    store.inputState('image', 'delivered');
+    expect(store.inputs()[1]!.images).toBe('[]'); expect(store.hasInput('image')).toBe(true);
+  } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('existing databases retain delivery state when deletion recovery is enabled', () => {
   const dir = mkdtempSync(join(tmpdir(), 'discordex-store-upgrade-'));
   const path = join(dir, 'state.sqlite');
