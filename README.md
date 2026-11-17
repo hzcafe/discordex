@@ -122,6 +122,7 @@ For an always-on installation, use the [Linux background-service guide](docs/con
 | Interrupt the current turn | `/codex stop` |
 | Inspect connectivity | `/codex status` |
 | View remaining allowance and token usage | `/codex usage` |
+| Choose the session's model and reasoning effort | `/codex model` in a linked thread |
 | View and manage the session's goal | `/codex goal` in a linked thread |
 | Answer an approval or question | Use the buttons or modal on its prompt card |
 
@@ -164,7 +165,9 @@ Final replies can share referenced images and videos as inline media, and docume
 
 ### Can I see or change the model in Discord?
 
-Cards display the model and reasoning effort when available. These start from captured session settings; a daemon-reported model reroute updates the turn's label. They are not a per-step execution audit. There is currently no Discord command for changing model settings. See [turn cards and model labels](docs/architecture.md#turn-cards-and-model-labels).
+Yes. Run `/codex model` in a linked thread to open a private model and reasoning-effort picker. The dropdowns use the daemon's available models and each model's supported efforts. Choose both, then **Apply**; the settings affect subsequent turns in that same session. Changing the model preserves your chosen effort when supported, otherwise selecting the new model's default. **Refresh** reloads the current settings and available models.
+
+Cards display the model and reasoning effort when available. These start from captured session settings; a daemon-reported model reroute updates the turn's label. They are not a per-step execution audit. See [turn cards and model labels](docs/architecture.md#turn-cards-and-model-labels).
 
 ### Is self-hosted the same as keeping all data local?
 

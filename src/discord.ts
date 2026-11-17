@@ -10,6 +10,7 @@ import { card, compact, deliveryNonce } from './render.js';
 import { approvalControls } from './approvals.js';
 import { deliveryFiles, discordPayload, discordEditPayload, prepareDiscordPayload, prepareDiscordEditPayload } from './components.js';
 import { parseGoalControl } from './goals.js';
+import { modelPickerPayload, parseModelControl } from './models.js';
 import { Store } from './store.js';
 import { discordNotFound, MissingMessageError, MissingThreadError, temporaryUploadFailure } from './chat.js';
 import { artifactUploads } from './artifacts.js';
@@ -90,6 +91,7 @@ export class DiscordAdapter implements ChatPort {
       .addSubcommand(c => c.setName('steer').setDescription('Send instructions into the active turn now').addStringOption(o => o.setName('message').setDescription('Instructions for Codex').setRequired(true)))
       .addSubcommand(c => c.setName('stop').setDescription('Interrupt the active turn'))
       .addSubcommand(c => c.setName('usage').setDescription('Show remaining account allowance and session token usage'))
+      .addSubcommand(c => c.setName('model').setDescription('Choose this session’s model and reasoning effort'))
       .addSubcommand(c => c.setName('goal').setDescription('Show and manage this session’s shared goal card'))
       .addSubcommand(c => c.setName('status').setDescription('Show bridge status'));
     // Upsert our command by name; do not overwrite other commands on the application.
@@ -177,7 +179,7 @@ export class DiscordAdapter implements ChatPort {
   }
   private async interact(interaction: Interaction): Promise<void> {
     if (this.closed) return;
-    if (!interaction.isChatInputCommand() && !interaction.isButton() && !interaction.isModalSubmit()) return;
+    if (!interaction.isChatInputCommand() && !interaction.isButton() && !interaction.isModalSubmit() && !interaction.isStringSelectMenu?.()) return;
     if (interaction.isChatInputCommand() && interaction.commandName !== 'codex') return;
     if (!interaction.isChatInputCommand() && !interaction.customId.startsWith('dx:')) return;
     if (interaction.guildId !== this.config.guildId || !this.config.allowedUserIds.includes(interaction.user.id)) {
@@ -188,6 +190,10 @@ export class DiscordAdapter implements ChatPort {
       await interaction.reply({ content: 'Use the configured Codex channel or a linked thread.', flags: MessageFlags.Ephemeral }); return;
     }
     try {
+      if (interaction.isChatInputCommand() ? interaction.options.getSubcommand() === 'model' : interaction.customId.startsWith('dx:model:')) {
+        await this.interactModel(interaction); return;
+      }
+      if (interaction.isStringSelectMenu?.()) return;
       if (interaction.isChatInputCommand() ? interaction.options.getSubcommand() === 'goal' : interaction.customId.startsWith('dx:goal:')) {
         await this.interactGoal(interaction); return;
       }
@@ -244,6 +250,24 @@ export class DiscordAdapter implements ChatPort {
       const content = compact(error instanceof Error ? error.message : String(error));
       if (interaction.deferred || interaction.replied) await interaction.editReply(discordEditPayload(card(content, { title: 'Unable to complete that action', tone: 'warning' }), [], [], this.config.artifacts));
       else await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+    }
+  }
+  private async interactModel(interaction: Interaction): Promise<void> {
+    if (!interaction.isChatInputCommand() && !interaction.isButton() && !interaction.isStringSelectMenu()) return;
+    const bridge = this.bridge!;
+    if (interaction.isChatInputCommand()) {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (this.closed) throw new Error('Discordex is shutting down. Try this action again after it reconnects.');
+      const picker = await bridge.modelPicker(interaction.channelId!, interaction.user.id);
+      await interaction.editReply(modelPickerPayload(picker));
+    } else {
+      const control = parseModelControl(interaction.customId);
+      if (interaction.isStringSelectMenu() !== ['model', 'effort'].includes(control.action)) throw new Error('Unknown model control. Run `/codex model` again.');
+      await interaction.deferUpdate();
+      if (this.closed) throw new Error('Discordex is shutting down. Try this action again after it reconnects.');
+      const picker = await bridge.modelAction(interaction.channelId!, interaction.user.id, control.token, control.revision,
+        control.action, interaction.isStringSelectMenu() ? interaction.values[0] : undefined);
+      await interaction.editReply(modelPickerPayload(picker));
     }
   }
   private async interactGoal(interaction: Interaction): Promise<void> {

@@ -52,6 +52,14 @@ Every agent has its own card, even when subagents share a Discord thread. Approv
 
 Footers show model and reasoning effort when available. The initial values are captured session settings, not per-turn execution telemetry. The source is tracked internally, and a daemon-reported model reroute updates that turn's model label. Later settings changes do not rewrite older cards. Recovered historical turns without a captured model are left unlabeled.
 
+## Model controls
+
+`/codex model` reads the linked top-level thread's current settings and paginates `model/list` for its configured provider. A private Components V2 picker offers model and supported-effort dropdowns, with model pages of at most 25 options. The catalog supplies names, descriptions, defaults, and effort choices. Opening or changing the draft does not mutate the session or block the bridge's serial queue.
+
+Pickers are scoped to their contributor, thread, Discord channel, connection epoch, and control revision. Drafts live in a bounded in-memory map for 15 minutes. Apply is serialized with other bridge work, revalidates the live catalog and session settings, and calls `thread/settings/update` with only the thread ID, model, and supported effort. An unchanged selection avoids a write. The same session and Discord thread remain linked; active and historical turn cards retain their captured settings, while subsequent turns use the new values.
+
+Apply consumes the draft before writing, preventing duplicate clicks from resubmitting. A fresh thread read confirms success. Uncertain writes are never automatically replayed: reopening the command reads the daemon's current settings. Preflight comparisons reject changes observed from another client, but the protocol has no atomic compare-and-set guarantee across clients.
+
 ## Usage cards
 
 `/codex usage` reads `account/rateLimits/read` on demand and renders an ephemeral Components V2 card. Ten-segment emoji bars visualize the remaining allowance alongside its percentage: blue normally, yellow at 20% or below, and red at 10% or below, with dark empty segments. Window labels come from the reported duration. Multiple quota buckets are supported, with up to four groups shown to keep the card compact. Discord timestamps display reset times relative to the reader. Explicit backend blocking takes precedence over apparently available percentages, and elapsed reset times never imply a refilled allowance.
@@ -122,6 +130,7 @@ Budget edits omit the objective and status to preserve usage accounting. Creatin
 | [`src/references.ts`](../src/references.ts) | Labels for references to attachments included in outgoing messages |
 | [`src/usage.ts`](../src/usage.ts) | Remaining-allowance bars, quota windows, and reported session counters |
 | [`src/goals.ts`](../src/goals.ts) | Shared goal cards, input validation, control versions, and goal RPCs |
+| [`src/models.ts`](../src/models.ts) | Private model/effort pickers, catalog pagination, draft validation, and settings RPCs |
 | [`src/store.ts`](../src/store.ts) | SQLite mappings, inbox, outbox, approvals, and turn-card state |
 | [`src/types.ts`](../src/types.ts) | The supported subset of the Codex protocol |
 

@@ -10,6 +10,7 @@ import { approvalDelivery, deliveryNonce, message, sessionCard } from './render.
 import { TurnCards } from './turns.js';
 import { tokenUsageSnapshot, usageCard } from './usage.js';
 import { Goals, type GoalAction, type GoalInput } from './goals.js';
+import { Models, type ModelAction } from './models.js';
 import type { AccountRateLimits, Binding, ChatPort, CodexPort, Delivery, Packet, Thread, Turn } from './types.js';
 
 export class Bridge {
@@ -23,11 +24,13 @@ export class Bridge {
   private listeners: { event: string; listener: (...args: any[]) => void }[] = [];
   private turns: TurnCards;
   private goals: Goals;
+  private models: Models;
   private artifacts: Artifacts;
 
   constructor(readonly config: Config, readonly codex: CodexPort, readonly store: Store,
     private chat: ChatPort, private log: (text: string) => void = console.error) {
     this.turns = new TurnCards(store); this.goals = new Goals(store, codex);
+    this.models = new Models(codex, thread => this.eligible(thread));
     this.artifacts = new Artifacts(store, config.artifacts);
   }
 
@@ -98,6 +101,25 @@ export class Bridge {
   }
   async goalAction(channelId: string, userId: string, threadId: string, version: string, action: GoalAction, input?: GoalInput): Promise<string> {
     return this.goals.act(this.goalBinding(channelId, userId, threadId), version, action, input);
+  }
+  private modelBinding(channelId: string, userId: string): Binding {
+    if (this.stopped) throw new Error('Discordex is shutting down. Try again after it reconnects.');
+    if (!this.config.allowedUserIds.includes(userId)) throw new Error('You are not configured to control Codex');
+    return this.requireBinding(channelId);
+  }
+  async modelPicker(channelId: string, userId: string) {
+    return this.models.open(this.modelBinding(channelId, userId), userId);
+  }
+  async modelAction(channelId: string, userId: string, token: string, revision: number, action: ModelAction, value?: string) {
+    const work = async () => {
+      const binding = this.modelBinding(channelId, userId);
+      const picker = await this.models.act(binding, userId, token, revision, action, value);
+      if (action === 'apply') {
+        this.saveModelSettings(this.store.binding(binding.threadId)!, picker.current.model, picker.current.effort);
+      }
+      return picker;
+    };
+    return action === 'apply' ? this.serial(work) : work();
   }
   async usage(channelId: string, userId: string): Promise<Delivery> {
     if (!this.config.allowedUserIds.includes(userId)) throw new Error('You are not configured to control this bot');
