@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="#quick-start"><strong>Quick start</strong></a> ·
-  <a href="docs/architecture.md"><strong>Architecture</strong></a> ·
+  <a href="https://github.com/hzcafe/discordex/blob/master/docs/architecture.md"><strong>Architecture</strong></a> ·
   <a href="docs/configuration.md"><strong>Configuration</strong></a> ·
   <a href="https://github.com/hzcafe/discordex/issues">Report a bug / request a feature</a>
 </p>
@@ -55,7 +55,7 @@ Shared Codex daemon  ↔  your local Codex client
 
 Discordex connects outbound to Discord's Gateway; it needs **no public HTTP endpoint or inbound port forwarding**. The Codex connection uses a local Unix socket. Exported conversation content goes to Discord, where your channel permissions determine who can read it.
 
-Read the [architecture and delivery guarantees](docs/architecture.md) for session discovery, turn rendering, and reconnect behavior.
+Read the [Discordex architecture guide](https://github.com/hzcafe/discordex/blob/master/docs/architecture.md) for how the daemon discovers sessions, which events become Discord cards, and how SQLite helps the bridge recover after a disconnect.
 
 ## Quick start
 
@@ -145,7 +145,7 @@ Temporary upload failures recover automatically on the same message, without hol
 | --- | --- |
 | [Configuration and hosting](docs/configuration.md) | Settings, contributor and approver access, Linux service, and troubleshooting |
 | [File sharing and media](docs/file-sharing.md) | Incoming media formats and retention, outgoing attachments, sharing roots, and size limits |
-| [Architecture](docs/architecture.md) | Bun/TypeScript stack, daemon discovery, editable cards, persistence, and recovery limits |
+| [Architecture](https://github.com/hzcafe/discordex/blob/master/docs/architecture.md) | Bun/TypeScript stack, daemon discovery, editable cards, persistence, and recovery limits |
 | [Development](#development) | Local checks, source map, and protocol updates |
 
 ## FAQ
@@ -172,7 +172,7 @@ In the other direction, a final reply can share a referenced image or video inli
 
 Yes. Run `/codex model` in a linked thread to open a private picker. It loads the model names and supported reasoning efforts from the daemon for that session's provider. Choose a model, check the effort, and press **Apply** to use those settings for subsequent turns in the same conversation. **Refresh** reloads the current settings and available models.
 
-Cards display the model and reasoning effort when available. These start from captured session settings; a daemon-reported model reroute updates the turn's label. They are not a per-step execution audit. See [turn cards and model labels](docs/architecture.md#turn-cards-and-model-labels).
+Cards display the model and reasoning effort when available. These start from captured session settings; a daemon-reported model reroute updates the turn's label. They are not a per-step execution audit. See [turn cards and model labels](https://github.com/hzcafe/discordex/blob/master/docs/architecture.md#turn-cards-and-model-labels).
 
 ### Is self-hosted the same as keeping all data local?
 
@@ -193,4 +193,4 @@ bun run build
 
 Use `bun dev` for watch mode. The build produces a Bun-targeted entry point in `dist/`; production can also run the TypeScript source directly. **Node.js is not a runtime dependency.**
 
-The [architecture guide](docs/architecture.md#source-map) maps the code and explains protocol compatibility. Bug reports and feature requests belong in [GitHub Issues](https://github.com/hzcafe/discordex/issues); include your Bun/Codex versions and reproduction steps, with tokens and private conversation content removed. Pull requests should include the relevant checks above.
+The [architecture guide](https://github.com/hzcafe/discordex/blob/master/docs/architecture.md#source-map) maps the code and explains protocol compatibility. Bug reports and feature requests belong in [GitHub Issues](https://github.com/hzcafe/discordex/issues); include your Bun/Codex versions and reproduction steps, with tokens and private conversation content removed. Pull requests should include the relevant checks above.
