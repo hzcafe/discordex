@@ -1,15 +1,48 @@
-import { ActionRowBuilder, ChannelType, Client,
+import { ActionRowBuilder, ChannelType, Client, ComponentType,
   Events, GatewayIntentBits, MessageFlags, ModalBuilder, SlashCommandBuilder, TextInputBuilder,
-  TextInputStyle, type Interaction, type Message, type TextChannel, type ThreadChannel } from 'discord.js';
+  TextInputStyle, type APIMessageComponent, type APIUnfurledMediaItem,
+  type Interaction, type Message, type TextChannel, type ThreadChannel } from 'discord.js';
 import { basename } from 'node:path';
 import { hostname } from 'node:os';
 import type { Config } from './config.js';
 import type { Bridge } from './bridge.js';
 import { card, compact, deliveryNonce } from './render.js';
-import { discordPayload, discordEditPayload } from './components.js';
+import { approvalControls } from './approvals.js';
+import { deliveryFiles, discordPayload, discordEditPayload, prepareDiscordPayload, prepareDiscordEditPayload } from './components.js';
 import { parseGoalControl } from './goals.js';
 import { Store } from './store.js';
-import type { ChatPort, Delivery, Packet, Thread } from './types.js';
+import { discordNotFound, MissingMessageError, MissingThreadError, temporaryUploadFailure } from './chat.js';
+import { artifactUploads } from './artifacts.js';
+import { rejectedReviewNotice, retryingReviewNotice, withoutGeneratedFile } from './uploads.js';
+import type { ChatPort, Delivery, DeliveryReceipt, Packet, Thread, UploadedFile, UploadFile } from './types.js';
+
+const uploadRejected = (error: unknown) => typeof error === 'object' && error !== null &&
+  (('status' in error && error.status === 413) || ('code' in error && [40005, 50035, 50045, 50146].includes(Number(error.code))));
+const withoutFiles = (delivery: Delivery, retrying: boolean): Delivery => ({ ...withoutGeneratedFile(delivery), artifacts: undefined,
+  artifactNotes: [...delivery.artifactNotes ?? [], ...(delivery.file?.requiredForActions
+    ? [retrying ? retryingReviewNotice : rejectedReviewNotice]
+    : [retrying ? 'Attachments are temporarily unavailable. Discordex is retrying automatically; you do not need to do anything.'
+      : 'Discord rejected the file upload; the text reply is shown here.',
+      ...(!retrying && delivery.file ? ['Full text is available in the local Codex session.'] : [])])] });
+
+/** V2 file/gallery uploads may be present only in components, with an empty attachments collection. */
+function messageFiles(message: Message): { id: string; name: string }[] {
+  const files = [...message.attachments?.values() ?? []].map(a => ({ id: a.id, name: a.name }));
+  const media = (item: APIUnfurledMediaItem) => {
+    if (!item.attachment_id) return;
+    try {
+      const name = decodeURIComponent(new URL(item.url).pathname.split('/').at(-1)!);
+      if (name) files.push({ id: item.attachment_id, name });
+    } catch { /* An unusable URL cannot identify an uploaded filename. */ }
+  };
+  const visit = (component: APIMessageComponent) => {
+    if (component.type === ComponentType.File) media(component.file);
+    else if (component.type === ComponentType.MediaGallery) component.items.forEach(item => media(item.media));
+    if ('components' in component) component.components.forEach(visit);
+  };
+  for (const component of message.components ?? []) visit(component.toJSON());
+  return files;
+}
 
 export class DiscordAdapter implements ChatPort {
   readonly client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -70,6 +103,10 @@ export class DiscordAdapter implements ChatPort {
     });
     this.client.on(Events.InteractionCreate, interaction => { void this.interact(interaction).catch(error => console.error(`Discord interaction: ${error}`)); });
     this.client.on(Events.Error, error => console.error(`Discord: ${error.message}`));
+    this.client.on(Events.ThreadDelete, channel => {
+      if (this.closed || channel.guildId !== this.config.guildId || channel.parentId !== this.config.channelId) return;
+      void bridge.serial(() => bridge.recoverChannel(channel.id)).catch(error => console.error(`Discord thread recovery: ${error}`));
+    });
     void this.catchUp();
     this.inboxTimer = setInterval(() => { void this.catchUp(); }, 30_000);
   }
@@ -83,7 +120,7 @@ export class DiscordAdapter implements ChatPort {
           const key = `inbox-cursor:${binding.channelId}`;
           // A Discord thread's snowflake is a natural lower boundary for its messages.
           let cursor = this.store.getMeta(key) ?? binding.channelId;
-          const channel = await this.channel(binding.channelId, false);
+          const channel = await this.channel(binding.channelId, false, true);
           while (!this.closed) {
             const page = await channel.messages.fetch({ after: cursor, limit: 100 });
             const ordered = [...page.values()].sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
@@ -94,7 +131,12 @@ export class DiscordAdapter implements ChatPort {
             }
             if (page.size < 100) break;
           }
-        } catch (error) { console.error(`Discord history recovery for ${binding.channelId}: ${error}`); }
+        } catch (error) {
+          if (!this.closed && error instanceof MissingThreadError) {
+            await this.bridge.serial(() => this.bridge!.recoverChannel(binding.channelId))
+              .catch(error => console.error(`Discord thread recovery for ${binding.channelId}: ${error}`));
+          } else console.error(`Discord history recovery for ${binding.channelId}: ${error}`);
+        }
       }
     } catch (error) { console.error(`Discord history recovery: ${error}`); }
     finally {
@@ -155,6 +197,7 @@ export class DiscordAdapter implements ChatPort {
         const approval = this.store.approval(token);
         if (!approval || approval.state !== 'pending' || approval.channel !== channelId || approval.epoch !== this.bridge!.codex.epoch) throw new Error('This prompt is no longer active');
         const p: Packet = JSON.parse(approval.packet);
+        if (!approvalControls(approval).includes('answer')) throw new Error('The full input request has not been delivered here. Its prompt card explains the delivery status.');
         const modal = new ModalBuilder().setCustomId(`dx:${token}:answer`).setTitle('Answer Codex');
         for (const [index, q] of p.params!.questions.entries()) {
           modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder()
@@ -181,7 +224,8 @@ export class DiscordAdapter implements ChatPort {
             const binding = await bridge.attach(interaction.options.getString('id', true)); result = `Connected: <#${binding.channelId}>`;
           } else if (sub === 'steer' || sub === 'stop') {
             await bridge.control(channelId, sub, interaction.options.getString('message') ?? undefined, interaction.user.id, interaction.user.username, interaction.id);
-          } else result = `Codex: ${bridge.codex.connected ? 'connected' : 'reconnecting'}\nLinked agents: ${this.store.bindings().length}\nPending prompts: ${this.store.pendingApprovals().length}`;
+          } else if (sub === 'retry') result = 'Delivery recovery is automatic now. No retry command is needed.';
+          else result = `Codex: ${bridge.codex.connected ? 'connected' : 'reconnecting'}\nLinked agents: ${this.store.bindings().length}\nPending prompts: ${this.store.pendingApprovals().length}\nBlocked deliveries: ${this.store.blockedDeliveries().length}`;
         });
       } else {
         const [, token, action] = interaction.customId.split(':');
@@ -195,10 +239,10 @@ export class DiscordAdapter implements ChatPort {
         await bridge.serial(() => bridge.decide(token!, action!, channelId, interaction.user.id, answers));
         result = 'Response sent to Codex';
       }
-      await interaction.editReply(discordEditPayload(delivery ?? card(result, { title: 'Codex', tone: 'info' })));
+      await interaction.editReply(discordEditPayload(delivery ?? card(result, { title: 'Codex', tone: 'info' }), [], [], this.config.artifacts));
     } catch (error) {
       const content = compact(error instanceof Error ? error.message : String(error));
-      if (interaction.deferred || interaction.replied) await interaction.editReply(discordEditPayload(card(content, { title: 'Unable to complete that action', tone: 'warning' })));
+      if (interaction.deferred || interaction.replied) await interaction.editReply(discordEditPayload(card(content, { title: 'Unable to complete that action', tone: 'warning' }), [], [], this.config.artifacts));
       else await interaction.reply({ content, flags: MessageFlags.Ephemeral });
     }
   }
@@ -242,37 +286,125 @@ export class DiscordAdapter implements ChatPort {
     const binding = this.store.byChannel(channelId)!;
     const messageId = this.store.messageId(`goal:${binding.threadId}`);
     result += messageId ? ` [Open goal card](https://discord.com/channels/${this.config.guildId}/${channelId}/${messageId}).` : ' The shared card will appear in this thread.';
-    await interaction.editReply(discordEditPayload(card(result, { title: 'Codex goal', tone: 'info', compact: true, hideHeader: true })));
+    await interaction.editReply(discordEditPayload(card(result, { title: 'Codex goal', tone: 'info', compact: true, hideHeader: true }), [], [], this.config.artifacts));
   }
-  async createThread(thread: Thread): Promise<string> {
+  async createThread(thread: Thread, replacingChannelId?: string): Promise<string> {
     if (!this.parent) throw new Error('Discord is not ready');
-    const key = `starter:${thread.id}`;
-    let id = this.store.getMeta(key);
-    if (!id) {
-      const starter = await this.parent.send({ ...discordPayload(card(`**Project**\n\`${thread.cwd}\`\n\nOpen the thread below to follow this session or send instructions.`, {
-        title: thread.name || basename(thread.cwd), subtitle: `Local session · ${hostname()}`, tone: 'info',
-      })), nonce: deliveryNonce(key), enforceNonce: true });
-      id = starter.id; this.store.setMeta(key, id);
+    // Each deleted channel gets its own durable creation attempt. A crash before
+    // rebinding can reuse the replacement starter without creating another thread.
+    const base = `starter:${thread.id}${replacingChannelId ? `:replacement:${replacingChannelId}` : ''}`;
+    for (let attempt = 0; ; attempt++) {
+      const key = this.store.getMeta(`${base}:generation`) ?? base;
+      let id = this.store.getMeta(key);
+      if (id) {
+        // Deleting a starter message need not delete its thread. Reuse the
+        // surviving thread even if fetching that message would now return 404.
+        try { await this.checkThread(id); return id; }
+        catch (error) { if (!(error instanceof MissingThreadError) || error.channelId !== id) throw error; }
+      }
+      if (!id) {
+        const starter = await this.parent.send({ ...discordPayload(card(`**Project**\n\`${thread.cwd}\`\n\nOpen the thread below to follow this session or send instructions.`, {
+          title: thread.name || basename(thread.cwd), subtitle: `Local session · ${hostname()}`, tone: 'info',
+        }), [], [], this.config.artifacts), nonce: deliveryNonce(key), enforceNonce: true });
+        id = starter.id; this.store.setMeta(key, id);
+      }
+      try {
+        const starter = await this.parent.messages.fetch({ message: id, force: true });
+        // A message-created thread has the starter's ID; cached flags can outlive it.
+        if (starter.hasThread) { await this.checkThread(id); return id; }
+        try {
+          const created = await starter.startThread({ name: compact(`${thread.name || basename(thread.cwd)} · ${thread.id.slice(0, 8)}`, 100), autoArchiveDuration: 1440 });
+          return created.id;
+        } catch (error) {
+          // The thread may have been created just before a lost response/restart.
+          if (typeof error === 'object' && error !== null && 'code' in error && error.code === 160004) {
+            await this.checkThread(id); return id;
+          }
+          throw error;
+        }
+      } catch (error) {
+        if (!discordNotFound(error, 10008) && !(error instanceof MissingThreadError && error.channelId === id)) throw error;
+        // A new nonce is needed even if the saved starter was deleted immediately.
+        this.store.setMeta(`${base}:generation`, `${base}:${crypto.randomUUID()}`);
+        if (attempt >= 1) throw error;
+      }
     }
-    const starter = await this.parent.messages.fetch(id);
-    // A message-created thread has the starter message's ID, even if not cached.
-    if (starter.hasThread) return starter.id;
-    const created = await starter.startThread({ name: compact(`${thread.name || basename(thread.cwd)} · ${thread.id.slice(0, 8)}`, 100), autoArchiveDuration: 1440 });
-    return created.id;
   }
-  private async channel(id: string, activate = true): Promise<ThreadChannel> {
-    const channel = await this.client.channels.fetch(id);
+  async checkThread(channelId: string): Promise<void> { await this.channel(channelId, false, true); }
+  private async channel(id: string, activate = true, force = false): Promise<ThreadChannel> {
+    let channel;
+    try { channel = await this.client.channels.fetch(id, { force }); }
+    catch (error) {
+      if (discordNotFound(error, 10003)) throw new MissingThreadError(id);
+      throw error;
+    }
     if (!channel?.isThread() || channel.guildId !== this.config.guildId || channel.parentId !== this.config.channelId) throw new Error('Linked Discord thread is unavailable or outside the configured channel');
     if (activate && channel.archived && !channel.locked) await channel.setArchived(false);
     return channel;
   }
-  async send(channelId: string, delivery: Delivery, nonce: string): Promise<string> {
-    const channel = await this.channel(channelId);
-    return (await channel.send({ ...discordPayload(delivery), nonce, enforceNonce: true })).id;
+  private rememberFiles(channelId: string, message: Message, delivery: Delivery, files: UploadFile[]): void {
+    const uploaded: UploadedFile[] = [];
+    const available = messageFiles(message);
+    for (const file of deliveryFiles(delivery, files, this.config.artifacts)) {
+      const attachment = available.find(a => a.name === file.name);
+      if (attachment) uploaded.push({ name: file.name, hash: file.hash, id: attachment.id });
+    }
+    this.store.setMeta(`attachments:${channelId}:${message.id}`, JSON.stringify(uploaded));
   }
-  async edit(channelId: string, id: string, delivery: Delivery): Promise<void> {
-    const channel = await this.channel(channelId);
-    await channel.messages.edit(id, discordEditPayload(delivery));
+  async send(channelId: string, delivery: Delivery, nonce: string): Promise<string | (DeliveryReceipt & { id: string })> {
+    try {
+      const channel = await this.channel(channelId);
+      let prepared = artifactUploads(this.store, delivery);
+      let plan = prepareDiscordPayload(prepared.delivery, prepared.files, [], this.config.artifacts);
+      let retryAttachments = false;
+      let sent: Message;
+      try { sent = await channel.send({ ...plan.payload, nonce, enforceNonce: true }); }
+      catch (error) {
+        retryAttachments = temporaryUploadFailure(error);
+        if ((!uploadRejected(error) && !retryAttachments) || !deliveryFiles(prepared.delivery, prepared.files, this.config.artifacts).length) throw error;
+        console.error(`Discord file upload rejected: ${compact(String(error), 1000)}`);
+        prepared = { delivery: withoutFiles(prepared.delivery, retryAttachments), files: [] };
+        plan = prepareDiscordPayload(prepared.delivery, [], [], this.config.artifacts);
+        sent = await channel.send({ ...plan.payload, nonce, enforceNonce: true });
+      }
+      this.rememberFiles(channelId, sent, prepared.delivery, prepared.files);
+      return plan.approvalReview || retryAttachments ? { id: sent.id, approvalReview: plan.approvalReview,
+        ...(retryAttachments ? { retryAttachments: true } : {}) } : sent.id;
+    } catch (error) {
+      if (discordNotFound(error, 10003)) throw new MissingThreadError(channelId);
+      throw error;
+    }
+  }
+  async edit(channelId: string, id: string, delivery: Delivery): Promise<DeliveryReceipt> {
+    try {
+      const channel = await this.channel(channelId);
+      let retained: UploadedFile[] = JSON.parse(this.store.getMeta(`attachments:${channelId}:${id}`) ?? '[]');
+      if (retained.length) {
+        const current = await channel.messages.fetch({ message: id, force: true });
+        const available = messageFiles(current);
+        retained = retained.filter(r => available.some(a => a.id === r.id && a.name === r.name));
+      }
+      let prepared = artifactUploads(this.store, delivery, retained);
+      let plan = prepareDiscordEditPayload(prepared.delivery, prepared.files, retained, this.config.artifacts);
+      let retryAttachments = false;
+      let edited: Message;
+      try { edited = await channel.messages.edit(id, plan.payload); }
+      catch (error) {
+        retryAttachments = temporaryUploadFailure(error);
+        if ((!uploadRejected(error) && !retryAttachments) || !deliveryFiles(prepared.delivery, prepared.files, this.config.artifacts).length) throw error;
+        console.error(`Discord file upload rejected: ${compact(String(error), 1000)}`);
+        prepared = { delivery: withoutFiles(prepared.delivery, retryAttachments), files: [] };
+        plan = prepareDiscordEditPayload(prepared.delivery, [], [], this.config.artifacts);
+        edited = await channel.messages.edit(id, plan.payload);
+      }
+      // Test adapters and legacy clients may not return a full Discord message.
+      if (edited) this.rememberFiles(channelId, edited, prepared.delivery, prepared.files);
+      return { approvalReview: plan.approvalReview, ...(retryAttachments ? { retryAttachments: true } : {}) };
+    } catch (error) {
+      if (discordNotFound(error, 10003)) throw new MissingThreadError(channelId);
+      if (discordNotFound(error, 10008)) throw new MissingMessageError(channelId, id);
+      throw error;
+    }
   }
   async close(): Promise<void> {
     this.closed = true; clearInterval(this.inboxTimer);

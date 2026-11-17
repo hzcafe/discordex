@@ -101,7 +101,12 @@ export interface Button {
 }
 export interface Delivery {
   content: string;
-  file?: { name: string; content: string };
+  approvalReview?: { token: string; state: 'ready' | 'unavailable' };
+  file?: { name: string; content: string; requiredForActions?: boolean };
+  artifactRequest?: { cwd: string; references: string[] };
+  artifacts?: Artifact[];
+  artifactNotes?: string[];
+  preserveReferences?: boolean;
   buttons?: Button[];
   card?: {
     title: string;
@@ -112,10 +117,24 @@ export interface Delivery {
     footer?: string;
   };
 }
+export interface Artifact {
+  hash: string;
+  name: string;
+  kind: 'file' | 'image' | 'video';
+  size: number;
+  references?: string[];
+}
+export interface UploadFile extends Artifact { data: Buffer }
+export interface UploadedFile { hash: string; name: string; id: string }
+export interface DeliveryReceipt {
+  approvalReview?: Delivery['approvalReview'];
+  retryAttachments?: boolean;
+}
 export interface ChatPort {
-  createThread(thread: Thread): Promise<string>;
-  send(channelId: string, delivery: Delivery, nonce: string): Promise<string>;
-  edit(channelId: string, messageId: string, delivery: Delivery): Promise<void>;
+  createThread(thread: Thread, replacingChannelId?: string): Promise<string>;
+  checkThread(channelId: string): Promise<void>;
+  send(channelId: string, delivery: Delivery, nonce: string): Promise<string | (DeliveryReceipt & { id: string })>;
+  edit(channelId: string, messageId: string, delivery: Delivery): Promise<void | DeliveryReceipt>;
 }
 export interface CodexPort {
   readonly connected: boolean;

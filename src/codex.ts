@@ -93,7 +93,21 @@ export class CodexClient extends EventEmitter {
       });
     });
   }
-  respond(id: RequestId, result: unknown): Promise<void> { return this.write({ id, result }); }
+  async respond(id: RequestId, result: unknown): Promise<void> {
+    const socket = this.socket;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([this.write({ id, result }), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Codex approval response timed out; outcome may be unknown')), this.timeoutMs);
+      })]);
+    }
+    catch (error) {
+      // Do not retry a decision with an unknown outcome. Reconnect so Codex can
+      // replay requests that are still pending under a fresh connection epoch.
+      if (socket && this.socket === socket) socket.terminate();
+      throw error;
+    } finally { clearTimeout(timer); }
+  }
   private rejectPending(): void {
     for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error('Codex disconnected; request outcome may be unknown')); }
     this.pending.clear();

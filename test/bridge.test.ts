@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Bridge } from '../src/bridge.js';
 import { RpcError } from '../src/codex.js';
+import { artifactUploads } from '../src/artifacts.js';
+import { MissingMessageError, MissingThreadError } from '../src/chat.js';
 import { Store } from '../src/store.js';
 import type { Config } from '../src/config.js';
 import type { Binding, ChatPort, CodexPort, Delivery, Packet, Thread, Turn } from '../src/types.js';
@@ -52,12 +54,20 @@ class FakeChat implements ChatPort {
   sent: { channel: string; delivery: Delivery; nonce: string; id: string }[] = [];
   edits: { channel: string; id: string; delivery: Delivery }[] = [];
   fail = false;
-  async createThread(): Promise<string> { return 'created'; }
+  missing = new Set<string>();
+  created: { thread: Thread; replacing?: string }[] = [];
+  async checkThread(channel: string): Promise<void> { if (this.missing.has(channel)) throw new MissingThreadError(channel); }
+  async createThread(thread: Thread, replacing?: string): Promise<string> {
+    this.created.push({ thread, replacing }); return `created-${this.created.length}`;
+  }
   async send(channel: string, delivery: Delivery, nonce: string): Promise<string> {
+    await this.checkThread(channel);
     if (this.fail) throw new Error('Discord disconnected');
     const id = `message-${this.sent.length}`; this.sent.push({ channel, delivery, nonce, id }); return id;
   }
-  async edit(channel: string, id: string, delivery: Delivery): Promise<void> { this.edits.push({ channel, id, delivery }); }
+  async edit(channel: string, id: string, delivery: Delivery): Promise<void> {
+    await this.checkThread(channel); this.edits.push({ channel, id, delivery });
+  }
 }
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn(); });
@@ -71,6 +81,312 @@ function fixture(store = new Store(':memory:')) {
 function approval(id: string | number = 9): Packet {
   return { id, method: 'item/commandExecution/requestApproval', params: { threadId: 't1', turnId: 'turn1', itemId: 'command1', command: 'git status', availableDecisions: ['accept', 'decline'] } };
 }
+
+test.each(['command', 'diff'])('late %s details repair the same pending prompt and enable it only after delivery', async kind => {
+  const { bridge, codex, store } = fixture();
+  const packet: Packet = kind === 'command' ? approval() : { id: 7, method: 'item/fileChange/requestApproval',
+    params: { threadId: 't1', turnId: 'turn1', itemId: 'patch' } };
+  if (kind === 'command') delete packet.params!.command;
+  await bridge.serverRequest(structuredClone(packet));
+  await Bun.sleep(0); await bridge.flush();
+  const prompt = store.pendingApprovals()[0]!;
+  expect(prompt.reviewDelivery).toBe('unavailable');
+  expect(approvalDelivery(prompt).buttons).toEqual([]);
+  await expect(bridge.decide(prompt.token, 'accept', 'c1', 'alice')).rejects.toThrow('not offered');
+  await bridge.notification({ method: 'item/started', params: { threadId: 't1', turnId: 'turn1', item: kind === 'command'
+    ? { id: 'command1', type: 'commandExecution', command: 'git status', cwd: '/work/project' }
+    : { id: 'patch', type: 'fileChange', changes: [{ path: '/work/file.txt', diff: '+actual diff' }] } } });
+  expect(store.approval(prompt.token)!.reviewDelivery).toBe('pending');
+  await expect(bridge.decide(prompt.token, 'accept', 'c1', 'alice')).rejects.toThrow('not been delivered');
+  await bridge.flush();
+  expect(store.approval(prompt.token)!.reviewDelivery).toBe('ready');
+  const repaired = store.approval(prompt.token)!.packet;
+  await bridge.serverRequest(structuredClone(packet));
+  expect(store.approval(prompt.token)!.packet).toBe(repaired);
+  await bridge.decide(prompt.token, 'accept', 'c1', 'alice');
+  expect(codex.responses).toHaveLength(1);
+  await bridge.serverRequest(structuredClone(packet));
+  expect(store.approval(prompt.token)!.state).toBe('submitted');
+});
+
+test('same-ID daemon replay can supply missing details without creating a second approval', async () => {
+  const { bridge, store } = fixture();
+  const packet = approval(); delete packet.params!.command;
+  await bridge.serverRequest(packet);
+  const token = store.pendingApprovals()[0]!.token;
+  await bridge.serverRequest(approval());
+  await Bun.sleep(0); await bridge.flush();
+  expect(store.pendingApprovals()).toHaveLength(1);
+  expect(store.approval(token)!.reviewDelivery).toBe('ready');
+  expect(JSON.parse(store.approval(token)!.packet).params.command).toBe('git status');
+});
+
+test('terminal completion survives history failure and later hydration repairs final text', async () => {
+  const { bridge, codex, store } = fixture();
+  await bridge.notification({ method: 'turn/started', params: { threadId: 't1', turn: { id: 'turn1', status: 'inProgress' } } });
+  await bridge.serverRequest(approval());
+  const prompt = store.pendingApprovals()[0]!;
+  const request = codex.request.bind(codex);
+  codex.request = async (method, params) => { if (method === 'thread/turns/list') throw new Error('History unavailable'); return request(method, params); };
+  await bridge.notification({ method: 'turn/completed', params: { threadId: 't1', turn: { id: 'turn1', status: 'completed' } } });
+  expect(store.turnState('t1', 'turn1')!.turn.status).toBe('completed');
+  expect(store.approval(prompt.token)!.state).toBe('resolved');
+  expect(store.binding('t1')!.checkpoint).toBeNull();
+  await expect(bridge.decide(prompt.token, 'accept', 'c1', 'alice')).rejects.toThrow('no longer active');
+  codex.request = request;
+  codex.turns = [{ id: 'turn1', status: 'completed', items: [{ id: 'answer', type: 'agentMessage', text: 'Recovered answer.' }] }];
+  await bridge.sync();
+  expect(store.turnState('t1', 'turn1')!.turn.items![0]!.text).toBe('Recovered answer.');
+  expect(store.binding('t1')!.checkpoint).toBe('turn1');
+});
+
+test('an uncertain decision is not retried without fresh daemon evidence, and terminal prompts never reopen', async () => {
+  const { bridge, codex, store } = fixture();
+  await bridge.serverRequest(approval());
+  await Bun.sleep(0); await bridge.flush();
+  const prompt = store.pendingApprovals()[0]!;
+  const respond = codex.respond.bind(codex);
+  codex.respond = async () => { throw new Error('Write outcome unknown'); };
+  await expect(bridge.decide(prompt.token, 'accept', 'c1', 'alice')).rejects.toThrow('Write outcome unknown');
+  expect(store.approval(prompt.token)!.state).toBe('uncertain');
+  codex.respond = respond;
+  await expect(bridge.decide(prompt.token, 'accept', 'c1', 'alice')).rejects.toThrow('no longer active');
+  await bridge.sync();
+  expect(codex.responses).toHaveLength(0);
+  await bridge.serverRequest(approval());
+  await Bun.sleep(0); await bridge.flush();
+  expect(store.approval(prompt.token)!.state).toBe('pending');
+  await bridge.decide(prompt.token, 'decline', 'c1', 'alice');
+  expect(codex.responses).toEqual([{ id: 9, result: { decision: 'decline' } }]);
+  await bridge.notification({ method: 'serverRequest/resolved', params: { requestId: 9 } });
+  await bridge.serverRequest(approval());
+  expect(store.approval(prompt.token)!.state).toBe('resolved');
+});
+
+test('invalid output is quarantined without blocking approvals and resumes when its content changes', async () => {
+  const { bridge, chat, store } = fixture();
+  let attempts = 0;
+  const send = chat.send.bind(chat);
+  chat.send = async (channel, delivery, nonce) => {
+    if (delivery.content === 'Invalid output') { attempts++; throw Object.assign(new Error('Invalid form body'), { code: 50035 }); }
+    return send(channel, delivery, nonce);
+  };
+  store.enqueue('bad', 'c1', { content: 'Invalid output' });
+  await bridge.serverRequest(approval());
+  await Bun.sleep(0); await bridge.flush();
+  expect(attempts).toBe(1);
+  expect(store.blockedDeliveries('c1').map(r => r.key)).toEqual(['bad']);
+  expect(store.pendingApprovals()[0]!.reviewDelivery).toBe('ready');
+  expect(chat.sent.some(s => s.delivery.content.includes('rejected the message format'))).toBe(true);
+  expect(chat.sent.some(s => s.delivery.content.includes('/codex retry'))).toBe(false);
+  await bridge.flush(); expect(attempts).toBe(1);
+  chat.send = send;
+  store.revise('bad', { content: 'Corrected output' });
+  await bridge.flush();
+  expect(store.blockedDeliveries()).toHaveLength(0);
+  expect(chat.sent.some(s => s.delivery.content === 'Corrected output')).toBe(true);
+});
+
+test('oversized reviews explain the limit without retry loops; daemon replay after a config change restores delivery', async () => {
+  const { bridge, store, chat, codex } = fixture();
+  // The fixture passes the same config object through the bridge. Restore it after this check.
+  const previous = config.artifacts;
+  config.artifacts = { enabled: true, roots: [], maxFiles: 4, maxFileBytes: 10, maxTotalBytes: 12, cacheBytes: 1000, retentionDays: 7 };
+  try {
+    const packet = approval(); packet.params!.reason = 'Review context. '.repeat(400);
+    await bridge.serverRequest(packet);
+    await Bun.sleep(0); await bridge.flush();
+    const prompt = store.pendingApprovals()[0]!;
+    expect(prompt.reviewDelivery).toBe('unavailable');
+    expect(chat.sent.find(s => s.delivery.approvalReview)?.delivery.buttons).toBeUndefined();
+    await expect(bridge.decide(prompt.token, 'accept', 'c1', 'alice')).rejects.toThrow('not been delivered');
+    const delivered = chat.sent.length;
+    await bridge.flush(); await bridge.flush();
+    expect(chat.sent).toHaveLength(delivered);
+    expect(chat.sent.find(s => s.delivery.approvalReview)?.delivery.artifactNotes?.join()).toContain('exceed the attachment size limit');
+    config.artifacts = previous;
+    codex.epoch = 'connection-2';
+    await bridge.serverRequest(packet);
+    await Bun.sleep(0); await bridge.flush();
+    const replay = store.pendingApprovals().find(a => a.epoch === codex.epoch)!;
+    expect(replay.reviewDelivery).toBe('ready');
+    await bridge.decide(replay.token, 'accept', 'c1', 'alice');
+  } finally { config.artifacts = previous; }
+});
+
+test('a transient failure while retrying attachments does not hold up later messages', async () => {
+  const { bridge, chat, store } = fixture();
+  store.enqueue('reply', 'c1', { content: 'Reply with files', file: { name: 'response.md', content: 'Full answer' } });
+  store.delivered(store.outgoing()[0]!, 'existing-message', undefined, true);
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run();
+  store.enqueue('later', 'c1', { content: 'Later message' });
+  chat.edit = async () => { throw Object.assign(new Error('Temporary network failure'), { code: 'ECONNRESET' }); };
+  await bridge.flush();
+  expect(chat.sent.map(s => s.delivery.content)).toEqual(['Later message']);
+  expect(store.messageId('reply')).toBe('existing-message');
+  expect(store.db.query<{ partial: number; pending: number }, []>("SELECT partial, pending FROM outbox WHERE key = 'reply'").get()).toEqual({ partial: 1, pending: 1 });
+});
+
+test('slow scheduled syncs coalesce so new user work does not wait behind duplicate polls', async () => {
+  const { bridge, codex } = fixture();
+  let release!: () => void;
+  let calls = 0;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  bridge.sync = async () => { calls++; await held; };
+  bridge.start();
+  try {
+    await Bun.sleep(0);
+    for (let i = 0; i < 20; i++) codex.emit('ready');
+    const submitted = bridge.serial(async () => calls);
+    release();
+    expect(await submitted).toBe(1);
+    codex.emit('ready');
+    await bridge.serial(async () => {});
+    expect(calls).toBe(2);
+  } finally { release(); }
+});
+
+test('deleted threads move all agents, queued output and live controls without replaying delivered history or changing Codex', async () => {
+  const { bridge, codex, chat, store } = fixture();
+  store.saveBinding({ ...binding, checkpoint: 'completed' });
+  const child = { ...binding, threadId: 'child', parentThreadId: 't1', label: 'Reviewer' };
+  store.saveBinding(child);
+  store.addInput('input', 't1', 'queued instruction');
+  store.inputState('input', 'queued', 'queue-id');
+  store.setMeta('inbox-cursor:c1', 'old-cursor');
+  store.enqueue('attached:t1', 'c1', { content: 'Connected' });
+  const done = { turn: { id: 'completed', status: 'completed' as const }, completedItemIds: [], lastItemId: null };
+  store.publishTurn(binding, done, { content: 'Old delivered history' });
+  const active = { turn: { id: 'active', status: 'inProgress' as const }, completedItemIds: [], lastItemId: null };
+  store.publishTurn(child, active, { content: 'Reviewer working' });
+  store.publishGoal(binding, { goal: null, version: 'goal-version', epoch: codex.epoch }, { content: 'Current goal controls' });
+  const prompt = store.addApproval(codex.epoch, approval(), 'c1');
+  store.enqueue(`approval:${prompt.token}`, 'c1', approvalDelivery(prompt, binding));
+  for (const row of store.outgoing()) store.delivered(row, `old:${row.key}`);
+  store.enqueue('pending-reply', 'c1', { content: 'Undelivered reply' });
+  const stale = store.outgoing()[0]!;
+  chat.missing.add('c1');
+  await Promise.all([bridge.serial(() => bridge.recoverChannel('c1')), bridge.serial(() => bridge.recoverChannel('c1'))]);
+  expect(chat.created).toHaveLength(1);
+  expect(chat.created[0]!.replacing).toBe('c1');
+  expect(store.byChannel('c1')).toBeUndefined();
+  expect(store.binding('t1')!.channelId).toBe('created-1');
+  expect(store.binding('child')!.channelId).toBe('created-1');
+  expect(store.binding('t1')!.checkpoint).toBe('completed');
+  expect(store.inputs()[0]).toMatchObject({ state: 'queued', queueId: 'queue-id' });
+  expect(store.getMeta('inbox-cursor:c1')).toBeNull();
+  expect(store.approval(prompt.token)).toMatchObject({ channel: 'created-1', state: 'pending' });
+  expect(codex.calls).toHaveLength(0);
+  expect(codex.responses).toHaveLength(0);
+  store.delivered(stale, 'late-old-message'); store.retry(stale);
+  expect(store.messageId('pending-reply')).toBeNull();
+  await bridge.flush();
+  expect(chat.sent.map(s => s.channel)).toEqual(Array(5).fill('created-1'));
+  expect(chat.sent.some(s => s.delivery.content === 'Old delivered history')).toBe(false);
+  expect(chat.sent.some(s => s.delivery.content === 'Reviewer working')).toBe(true);
+  await expect(bridge.decide(prompt.token, 'accept', 'c1', 'alice')).rejects.toThrow('no longer active');
+  await bridge.decide(prompt.token, 'accept', 'created-1', 'alice');
+  expect(codex.responses).toEqual([{ id: 9, result: { decision: 'accept' } }]);
+});
+
+test('attach repairs a deleted thread again after replacement; access failures and excluded projects never recreate it', async () => {
+  const { bridge, chat, store } = fixture();
+  chat.missing.add('c1');
+  expect((await bridge.attach('t1')).channelId).toBe('created-1');
+  chat.missing.add('created-1');
+  expect((await bridge.attach('t1')).channelId).toBe('created-2');
+  expect(chat.created.map(c => c.replacing)).toEqual(['c1', 'created-1']);
+  chat.checkThread = async () => { throw new Error('Missing Access'); };
+  await expect(bridge.attach('t1')).rejects.toThrow('Missing Access');
+  expect(chat.created).toHaveLength(2);
+  store.saveBinding({ ...store.binding('t1')!, cwd: '/private' });
+  await bridge.recoverChannel('created-2');
+  expect(chat.created).toHaveLength(2);
+});
+
+test('delivery-triggered recovery cannot deadlock a serial flush and keeps retrying a failed creation', async () => {
+  const { bridge, chat, store } = fixture();
+  store.enqueue('reply', 'c1', { content: 'Pending reply' });
+  chat.missing.add('c1');
+  const create = chat.createThread.bind(chat);
+  chat.createThread = async () => { throw new Error('Discord unavailable'); };
+  await bridge.serial(() => bridge.flush());
+  await bridge.serial(async () => {});
+  expect(store.binding('t1')!.channelId).toBe('c1');
+  expect(store.messageId('reply')).toBeNull();
+  chat.createThread = create;
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run();
+  await bridge.serial(() => bridge.flush());
+  await bridge.serial(async () => {});
+  await bridge.flush();
+  expect(store.binding('t1')!.channelId).toBe('created-1');
+  expect(chat.sent[0]!.delivery.content).toBe('Pending reply');
+});
+
+test('a send finishing during thread replacement cannot acknowledge the new delivery or use the stale batch', async () => {
+  const { bridge, chat, store } = fixture();
+  store.enqueue('first', 'c1', { content: 'First' }); store.enqueue('second', 'c1', { content: 'Second' });
+  let release!: (id: string) => void;
+  const destinations: string[] = [];
+  const send = chat.send.bind(chat);
+  chat.send = async channel => { destinations.push(channel); return new Promise(resolve => { release = resolve; }); };
+  const flushing = bridge.flush(); await Bun.sleep(0);
+  chat.missing.add('c1');
+  await bridge.serial(() => bridge.recoverChannel('c1'));
+  release('old-message'); await flushing;
+  expect(destinations).toEqual(['c1']);
+  expect(store.outgoing()).toHaveLength(2);
+  expect(store.messageId('first')).toBeNull();
+  chat.send = send; await bridge.flush();
+  expect(chat.sent.map(s => s.channel)).toEqual(['created-1', 'created-1']);
+});
+
+test('deleted cards are resent with a new durable nonce, preserving the latest content across restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-deleted-card-'));
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'state.sqlite');
+  const { bridge, chat, store } = fixture(new Store(path));
+  store.enqueue('card', 'c1', { content: 'Original' }); await bridge.flush();
+  const original = chat.sent[0]!;
+  store.revise('card', { content: 'Latest' });
+  chat.edit = async (channel, id) => { throw new MissingMessageError(channel, id); };
+  await bridge.flush();
+  expect(store.messageId('card')).toBeNull();
+  const reopened = new Store(path);
+  try {
+    const retry = reopened.outgoing()[0]!;
+    expect(retry.generation).toBe(1);
+    expect(JSON.parse(retry.payload).content).toBe('Latest');
+  } finally { reopened.close(); }
+  await bridge.flush();
+  expect(chat.sent[1]!.delivery.content).toBe('Latest');
+  expect(chat.sent[1]!.nonce).not.toBe(original.nonce);
+  expect(chat.created).toHaveLength(0);
+});
+
+test('a final referenced file is snapshotted before delivery and survives retry plus deleted-thread recovery', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-file-delivery-'));
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+  const store = new Store(join(dir, 'state.sqlite')); const codex = new FakeCodex(); const chat = new FakeChat();
+  const bridge = new Bridge({ ...config, projectRoots: [dir] }, codex, store, chat, () => {});
+  cleanup.push(() => store.close()); cleanup.push(() => bridge.stop());
+  store.saveBinding({ ...binding, cwd: dir }); codex.thread.cwd = dir;
+  await Bun.write(join(dir, 'plan.md'), '# Original plan');
+  await bridge.notification({ method: 'item/completed', params: { threadId: 't1', turnId: 'turn1', item: {
+    id: 'answer', type: 'agentMessage', phase: 'final_answer', text: 'See [the plan](plan.md).',
+  } } });
+  await bridge.flush(); expect(chat.sent[0]!.delivery.artifactRequest).toBeUndefined();
+  chat.edit = async () => { throw new Error('Disconnected'); };
+  await bridge.notification({ method: 'turn/completed', params: { threadId: 't1', turn: { id: 'turn1', status: 'completed' } } });
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run(); await bridge.flush();
+  await Bun.write(join(dir, 'plan.md'), '# A later change');
+  chat.missing.add('c1'); await bridge.serial(() => bridge.recoverChannel('c1')); await bridge.flush();
+  const final = chat.sent.at(-1)!;
+  expect(final.channel).toBe('created-1');
+  expect(final.delivery.artifacts).toHaveLength(1);
+  expect(artifactUploads(store, final.delivery).files[0]!.data.toString()).toBe('# Original plan');
+  expect(codex.calls.some(c => ['turn/start', 'turn/interrupt', 'thread/goal/set', 'thread/queue/add'].includes(c.method))).toBe(false);
+});
 
 test('usage reads fresh account limits and remembers separate parent/subagent counters without posting messages', async () => {
   const { bridge, codex, store, chat } = fixture();
@@ -280,6 +596,17 @@ test('one approval decision is sent, only offered decisions are accepted, and lo
   expect(store.approval(a.token)!.state).toBe('resolved');
 });
 
+test('authorized approvers can decide requests containing machine paths from Discord', async () => {
+  const { bridge, codex, store } = fixture();
+  const packet = approval(); packet.params!.command = 'rm /home/alice/private/report.md';
+  await bridge.serverRequest(packet);
+  const prompt = store.pendingApprovals()[0]!;
+  await expect(bridge.decide(prompt.token, 'accept', 'c1', 'bob')).rejects.toThrow('approver');
+  await bridge.decide(prompt.token, 'accept', 'c1', 'alice');
+  expect(store.approval(prompt.token)!.state).toBe('submitted');
+  expect(codex.responses).toEqual([{ id: 9, result: { decision: 'accept' } }]);
+});
+
 test('reconnect invalidates old prompts even when a new connection reuses the same RPC ID', async () => {
   const { bridge, codex, store } = fixture();
   await bridge.serverRequest(approval('9'));
@@ -289,6 +616,7 @@ test('reconnect invalidates old prompts even when a new connection reuses the sa
   await bridge.serverRequest(approval('9'));
   const fresh = store.pendingApprovals().find(a => a.epoch === 'connection-2')!;
   expect(fresh.token).not.toBe(old.token);
+  await Bun.sleep(0); await bridge.flush();
   await bridge.decide(fresh.token, 'decline', 'c1', 'alice');
   expect(codex.responses).toEqual([{ id: '9', result: { decision: 'decline' } }]);
 });
@@ -298,6 +626,7 @@ test('permission approval grants exactly the requested scope for one turn', asyn
   await bridge.serverRequest({ id: 7, method: 'item/permissions/requestApproval', params: {
     threadId: 't1', turnId: 'turn1', permissions: { network: { enabled: true }, fileSystem: null },
   } });
+  await Bun.sleep(0); await bridge.flush();
   await bridge.decide(store.pendingApprovals()[0]!.token, 'accept', 'c1', 'alice');
   expect(codex.responses[0]!.result).toEqual({ permissions: { network: { enabled: true } }, scope: 'turn' });
 });
@@ -308,6 +637,7 @@ test('multi-question responses keep question IDs, and secret questions stay loca
     { id: 'a', question: 'Which?', header: 'Choice' }, { id: 'b', question: 'Why?', header: 'Reason' },
   ] } };
   await bridge.serverRequest(packet);
+  await Bun.sleep(0); await bridge.flush();
   await bridge.decide(store.pendingApprovals()[0]!.token, 'answer', 'c1', 'alice', { a: 'First', b: 'Simpler' });
   expect(codex.responses[0]!.result).toEqual({ answers: { a: { answers: ['First'] }, b: { answers: ['Simpler'] } } });
   await bridge.serverRequest({ ...packet, id: 8, params: { ...packet.params, questions: [{ id: 's', question: 'Secret', isSecret: true }] } });

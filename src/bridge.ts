@@ -1,8 +1,11 @@
 import { relative, isAbsolute, basename } from 'node:path';
 import type { Config } from './config.js';
 import { RpcError } from './codex.js';
-import { Store, type ApprovalState } from './store.js';
-import { approvalActions } from './approvals.js';
+import { invalidDelivery, MissingMessageError, MissingThreadError } from './chat.js';
+import { Artifacts } from './artifacts.js';
+import { Store, type Approval, type ApprovalState } from './store.js';
+import { approvalActions, approvalControls, enrichApproval } from './approvals.js';
+import { prepareUploads } from './uploads.js';
 import { approvalDelivery, deliveryNonce, message, sessionCard } from './render.js';
 import { TurnCards } from './turns.js';
 import { tokenUsageSnapshot, usageCard } from './usage.js';
@@ -14,15 +17,18 @@ export class Bridge {
   private flushing = false;
   private timer?: ReturnType<typeof setInterval>;
   private deliveryTimer?: ReturnType<typeof setInterval>;
+  private syncPending = false;
   private subscribed = new Set<string>();
   private stopped = false;
   private listeners: { event: string; listener: (...args: any[]) => void }[] = [];
   private turns: TurnCards;
   private goals: Goals;
+  private artifacts: Artifacts;
 
   constructor(readonly config: Config, readonly codex: CodexPort, readonly store: Store,
     private chat: ChatPort, private log: (text: string) => void = console.error) {
     this.turns = new TurnCards(store); this.goals = new Goals(store, codex);
+    this.artifacts = new Artifacts(store, config.artifacts);
   }
 
   // Codex notifications and human submissions share one ordering boundary.
@@ -35,7 +41,7 @@ export class Bridge {
     this.expireApprovals();
     this.invalidateGoals();
     for (const input of this.store.inputs()) if (input.state === 'submitting') this.store.inputState(input.id, 'unknown');
-    this.listen('ready', () => { void this.serial(() => this.sync()); });
+    this.listen('ready', () => { this.scheduleSync(); });
     this.listen('disconnected', () => { this.subscribed.clear(); this.expireApprovals(); this.invalidateGoals(); });
     this.listen('notification', (packet: Packet) => {
       const epoch = this.codex.epoch;
@@ -45,9 +51,17 @@ export class Bridge {
       const epoch = this.codex.epoch;
       void this.serial(() => epoch === this.codex.epoch && this.codex.connected ? this.serverRequest(packet) : Promise.resolve());
     });
-    this.timer = setInterval(() => { void this.serial(() => this.sync()); }, 15_000);
+    this.timer = setInterval(() => { this.scheduleSync(); }, 15_000);
     this.deliveryTimer = setInterval(() => { void this.flush(); }, 1000);
-    if (this.codex.connected) void this.serial(() => this.sync());
+    if (this.codex.connected) this.scheduleSync();
+  }
+  private scheduleSync(): void {
+    if (this.stopped || this.syncPending) return;
+    this.syncPending = true;
+    void this.serial(async () => {
+      try { await this.sync(); }
+      finally { this.syncPending = false; }
+    });
   }
   private listen(event: string, listener: (...args: any[]) => void): void {
     this.listeners.push({ event, listener }); this.codex.on(event, listener);
@@ -130,6 +144,10 @@ export class Bridge {
     const { thread } = await this.codex.request<{ thread: Thread }>('thread/read', { threadId });
     if (!this.eligible(thread)) throw new Error('This project is outside the configured projectRoots');
     let binding = this.store.binding(threadId);
+    if (binding && !binding.parentThreadId) {
+      await this.recoverChannel(binding.channelId);
+      binding = this.store.binding(threadId)!;
+    }
     if (!binding) {
       const page = await this.codex.request<{ data: Turn[] }>('thread/turns/list', { threadId, limit: 1, itemsView: 'notLoaded' });
       const active = page.data.find(t => t.status === 'inProgress');
@@ -145,6 +163,17 @@ export class Bridge {
     this.saveModelSettings(binding, thread.model, thread.reasoningEffort);
     await this.subscribe(binding);
     return binding;
+  }
+  /** Run on the bridge's serial queue, so input, controls, and all agents move together. */
+  async recoverChannel(channelId: string): Promise<void> {
+    const binding = this.store.byChannel(channelId);
+    if (this.stopped || !binding || !this.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) return;
+    try { await this.chat.checkThread(channelId); return; }
+    catch (error) { if (!(error instanceof MissingThreadError) || error.channelId !== channelId) throw error; }
+    const replacement = await this.chat.createThread({ id: binding.threadId, name: binding.label, cwd: binding.cwd,
+      parentThreadId: null, status: { type: '' } }, channelId);
+    this.store.replaceChannel(channelId, replacement);
+    this.log(`Recreated Discord thread ${channelId} as ${replacement} for ${binding.threadId}`);
   }
   private async subscribe(binding: Binding): Promise<void> {
     if (this.subscribed.has(binding.threadId)) return;
@@ -198,6 +227,7 @@ export class Bridge {
         this.store.saveItem(binding.threadId, item);
         if (item.type === 'userMessage' && item.clientId) this.confirmInput(item.clientId);
       }
+      this.refreshApprovals(binding);
       this.turns.reconcile(binding, turn);
       if (turn.status !== 'inProgress') {
         this.completeTurn(binding, turn);
@@ -235,13 +265,18 @@ export class Bridge {
       if (usage) this.store.saveTokenUsage(binding.threadId, usage);
     } else if (packet.method === 'item/started' || packet.method === 'item/completed') {
       this.store.saveItem(binding.threadId, p.item);
+      this.refreshApprovals(binding);
       if (p.item.type === 'userMessage' && p.item.clientId) this.confirmInput(p.item.clientId);
       this.turns.item(binding, p.turnId, p.item, packet.method === 'item/completed');
     } else if (packet.method === 'turn/completed') {
-      // The completion payload need not contain items; hydrate durable history first.
-      await this.reconcile(binding);
+      // Terminal evidence takes effect immediately, even when optional history hydration fails.
       this.completeTurn(binding, p.turn);
-      if (!binding.parentThreadId) await this.drainInputs(binding);
+      try { await this.reconcile(binding); }
+      catch (error) { this.log(`Completion history ${binding.threadId}: ${error}`); }
+      if (!binding.parentThreadId) {
+        try { await this.drainInputs(binding); }
+        catch (error) { this.log(`Completion input drain ${binding.threadId}: ${error}`); }
+      }
     } else if (packet.method === 'turn/started') {
       // The live read captures selected settings; it does not assert execution
       // identity. Later settings changes are only used for subsequent cards.
@@ -264,22 +299,27 @@ export class Bridge {
   async serverRequest(packet: Packet): Promise<void> {
     const binding = this.store.binding(packet.params?.threadId);
     if (!binding || !this.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) return;
-    const snapshot = this.store.item(binding.threadId, packet.params!.itemId);
-    if (packet.method === 'item/commandExecution/requestApproval' && snapshot?.type === 'commandExecution') {
-      packet.params!.command ??= snapshot.command;
-      packet.params!.cwd ??= snapshot.cwd;
-    }
-    if (packet.method === 'item/fileChange/requestApproval') {
-      const item = this.store.item(binding.threadId, packet.params!.itemId);
-      if (item?.changes?.length) packet.params!.discordexDiff = item.changes.map((c: any) => `${c.path}\n${c.diff ?? ''}`).join('\n');
-    }
+    packet = enrichApproval(packet, this.store.item(binding.threadId, packet.params!.itemId));
     const approval = this.store.addApproval(this.codex.epoch, packet, binding.channelId);
-    this.store.enqueue(`approval:${approval.token}`, binding.channelId, approvalDelivery(approval, binding));
+    this.publishApproval(approval);
     if (packet.params?.turnId) this.turns.refresh(binding, packet.params.turnId, true);
     void this.flush();
   }
+  private publishApproval(approval: Approval): void {
+    const delivery = approvalDelivery(approval, this.store.binding(approval.threadId));
+    this.store.enqueue(`approval:${approval.token}`, approval.channel, delivery);
+    this.store.revise(`approval:${approval.token}`, delivery);
+  }
+  private refreshApprovals(binding: Binding): void {
+    for (const a of this.store.pendingApprovals()) {
+      if (a.state !== 'pending' || a.epoch !== this.codex.epoch || a.threadId !== binding.threadId) continue;
+      const packet: Packet = JSON.parse(a.packet);
+      const enriched = enrichApproval(packet, this.store.item(binding.threadId, packet.params!.itemId));
+      if (this.store.updateApprovalPacket(a.token, enriched)) this.publishApproval(this.store.approval(a.token)!);
+    }
+  }
   private finishApproval(token: string, state: Exclude<ApprovalState, 'pending'>): void {
-    this.store.approvalState(token, state);
+    if (!this.store.approvalState(token, state)) return;
     const approval = this.store.approval(token)!;
     const binding = this.store.binding(approval.threadId);
     this.store.revise(`approval:${token}`, approvalDelivery(approval, binding));
@@ -294,6 +334,7 @@ export class Bridge {
     this.requireBinding(channelId);
     const p: Packet = JSON.parse(a.packet);
     if (!approvalActions(p).some(offered => offered === action)) throw new Error('This decision is not offered for this request');
+    if (!approvalControls(a).some(offered => offered === action)) throw new Error('The full review has not been delivered here. The prompt card explains the delivery status; approval will be available when the details arrive.');
     let result: unknown;
     if (action === 'answer') {
       const values: Record<string, { answers: string[] }> = {};
@@ -308,7 +349,10 @@ export class Bridge {
     } else result = { decision: action };
     this.finishApproval(token, 'submitted');
     try { await this.codex.respond(p.id!, result); }
-    catch (error) { this.finishApproval(token, 'expired'); throw error; }
+    catch (error) {
+      this.finishApproval(token, a.epoch === this.codex.epoch && this.codex.connected ? 'uncertain' : 'expired');
+      throw error;
+    }
   }
   async submit(channelId: string, id: string, userId: string, name: string, text: string): Promise<string> {
     if (!this.config.allowedUserIds.includes(userId)) throw new Error('You are not configured to send messages to Codex');
@@ -397,15 +441,51 @@ export class Bridge {
     try {
       const failedChannels = new Set<string>();
       for (const row of this.store.outgoing()) {
-        if (failedChannels.has(row.channel)) continue;
+        if (failedChannels.has(row.channel) || !this.store.currentDelivery(row)) continue;
         try {
-          const delivery = JSON.parse(row.payload);
-          if (row.message) { await this.chat.edit(row.channel, row.message, delivery); this.store.delivered(row, row.message); }
-          else {
-            const nonce = deliveryNonce(row.key);
-            this.store.delivered(row, await this.chat.send(row.channel, delivery, nonce));
+          const source: Delivery = JSON.parse(row.payload);
+          let delivery: Delivery;
+          try { delivery = source.artifactRequest ? await this.artifacts.prepare(row.key, source) : source; }
+          catch (error) {
+            this.log(`Attachment preparation failed: ${error}`);
+            delivery = { ...source, artifactNotes: ['Referenced files could not be prepared.'] };
           }
-        } catch (error) { failedChannels.add(row.channel); this.store.retry(row); this.log(`Discord delivery failed: ${error}`); }
+          if (delivery.approvalReview) delivery = prepareUploads(delivery, [], this.config.artifacts).delivery;
+          if (!this.store.currentDelivery(row)) continue;
+          if (row.message) {
+            const receipt = await this.chat.edit(row.channel, row.message, delivery);
+            this.store.delivered(row, row.message, receipt?.approvalReview ?? delivery.approvalReview, receipt?.retryAttachments);
+          }
+          else {
+            const nonce = deliveryNonce(row.generation ? `${row.key}:${row.channel}:${row.generation}` : row.key);
+            const sent = await this.chat.send(row.channel, delivery, nonce);
+            this.store.delivered(row, typeof sent === 'string' ? sent : sent.id,
+              typeof sent === 'string' ? delivery.approvalReview : sent.approvalReview ?? delivery.approvalReview,
+              typeof sent === 'string' ? false : sent.retryAttachments);
+          }
+        } catch (error) {
+          if (invalidDelivery(error)) {
+            if (this.store.blockDelivery(row, String(error)) && !row.key.startsWith('delivery-warning:')) {
+              this.store.enqueue(`delivery-warning:${row.key}:${row.generation}:${row.revision}`, row.channel,
+                message(row.key.startsWith('approval:')
+                  ? 'Discord could not display an approval request because it rejected the message format. The request is still waiting. Open this session in Codex on the host to review and respond. Other messages can still arrive here.'
+                  : 'Discord could not display a message because it rejected the message format. The full content is available in this session in Codex on the host. Other messages can still arrive here.'));
+            }
+            this.log(`Discord delivery blocked (${row.key}): ${error}`);
+            continue;
+          }
+          if (!row.partial) failedChannels.add(row.channel);
+          if (error instanceof MissingMessageError && error.channelId === row.channel && error.messageId === row.message) {
+            this.store.recreateMessage(row);
+          } else {
+            this.store.retry(row);
+            // Do not await the serial queue: callers may already hold it while flushing.
+            if (error instanceof MissingThreadError && error.channelId === row.channel) {
+              void this.serial(() => this.recoverChannel(row.channel)).catch(() => {});
+            }
+          }
+          this.log(`Discord delivery failed: ${error}`);
+        }
       }
     } finally { this.flushing = false; }
   }

@@ -103,3 +103,29 @@ test('immediate stop/start retires the old socket and rejects its pending RPCs',
     expect(activeSockets).toBe(0);
   } finally { client.stop(); await server.stop(true); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test.each(['error', 'timeout'])('approval write %s retires the socket and obtains a fresh epoch without replaying the decision', async failure => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-approval-write-')); const path = join(dir, 'codex.sock');
+  let decisions = 0;
+  const server = Bun.serve({ unix: path,
+    fetch(req, server) { if (server.upgrade(req)) return; return new Response('Upgrade required', { status: 400 }); },
+    websocket: { message(ws, raw) {
+      const packet = JSON.parse(String(raw));
+      if (packet.method === 'initialize') ws.send(JSON.stringify({ id: packet.id, result: {} }));
+      if (packet.id === 'approval') decisions++;
+    } },
+  });
+  const client = new CodexClient(path, 200);
+  try {
+    const first = new Promise<void>(resolve => client.once('ready', resolve)); client.start(); await first;
+    const epoch = client.epoch;
+    const socket = (client as any).socket;
+    socket.send = (_data: string, callback: (error?: Error) => void) => { if (failure === 'error') callback(new Error('write failed')); };
+    const ready = new Promise<void>(resolve => client.once('ready', resolve));
+    await expect(client.respond('approval', { decision: 'accept' })).rejects.toThrow(failure === 'error' ? 'write failed' : 'outcome may be unknown');
+    await ready;
+    expect(client.epoch).not.toBe(epoch);
+    expect(client.connected).toBe(true);
+    expect(decisions).toBe(0);
+  } finally { client.stop(); await server.stop(true); rmSync(dir, { recursive: true, force: true }); }
+});

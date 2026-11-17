@@ -19,6 +19,7 @@ Start from [`discordex.config.example.json`](../discordex.config.example.json) a
 | `projectRoots` | `[]` allows all projects. Otherwise, use absolute roots; descendants are included |
 | `socketPath` | `$CODEX_HOME/app-server-control/app-server-control.sock`, with `CODEX_HOME` defaulting to `~/.codex` |
 | `stateDir` | `$XDG_STATE_HOME/discordex`, with `XDG_STATE_HOME` defaulting to `~/.local/state` |
+| `artifacts` | Automatic document/media sharing, enabled by default; see [file sharing](file-sharing.md) for roots, upload limits, and cache retention |
 
 If supplied, `socketPath` and `stateDir` must be absolute paths. Legacy `verbosity` settings are ignored; there are no verbosity modes.
 
@@ -47,9 +48,11 @@ Every allowed user's text in a linked thread is forwarded to Codex, including di
 
 Command, file-change, and permission requests use interactive buttons. Supported user-input questions use a modal. Decisions are one-time or turn-scoped; they do not permanently change approval policy.
 
-Buttons work only for configured approvers and only for the exact pending request. A decision in the local Codex client removes the corresponding Discord controls. Reconnects invalidate old controls; only requests replayed by Codex get fresh controls.
+Buttons work only for configured approvers and only for the exact pending request whose full review was delivered. A decision in the local Codex client removes the corresponding Discord controls. Reconnects invalidate old controls; only requests replayed by Codex get fresh controls. If sending a decision fails or times out, Discordex reconnects to recover authoritative pending requests without automatically sending the decision again.
 
-A file approval without an available diff, a secret question, or an unsupported request type must be answered in the local client. Approval and input cards remain separate from turn progress cards so an update cannot hide a pending decision.
+A command approval without its command or a file approval without its diff waits for those details. Later item events, history reads, or request replays update the same prompt automatically. Secret questions and unsupported request types, including terminal-input approvals that cannot be reviewed as a command, require the local client. Approval and input requests preserve exact commands, working directories, paths, and permission scopes so supported requests can be reviewed and answered in Discord. Only references to delivered attachments are rewritten in ordinary replies; this does not change approval details or disable their controls. Approval and input cards remain separate from turn progress cards so an update cannot hide a pending decision.
+
+If a required review attachment cannot be delivered, the prompt remains pending but its Discord actions are unavailable. Temporary upload failures show a status notice and recover automatically on the same message, without blocking later messages or resending approval decisions. If a size or format limit prevents delivery, the notice explains the limitation and how to review that request in Codex on the host. Users do not need to diagnose a failure or run a retry command. `/codex status` includes the number of quarantined deliveries.
 
 ## Run as a Linux background service
 
@@ -78,8 +81,11 @@ If it must keep running after your last login session ends, enable user lingerin
 | `doctor` cannot connect | Start `codex app-server daemon start`. Check the Codex version, `CODEX_HOME`, and any custom `socketPath`. |
 | No sessions appear | A session must be loaded on the connected daemon and inside `projectRoots`. Try `/codex sessions`. Sessions using `--no-daemon` are not visible. |
 | No bot messages or threads | Check the token, server/channel IDs, invite scopes, channel permissions, and service logs. `doctor` checks Codex connectivity; it does not validate a full Discord round trip. |
+| A linked Discord thread was deleted | Discordex automatically creates a replacement for the same Codex session when it detects deletion, normally by the next 30-second history check. `/codex attach` also checks the saved thread. Codex keeps running; delivered Discord history is not restored. |
+| A bot card was deleted | The next attempted update recreates the card. Missing permissions, locked threads, or temporary failures are retried without creating replacement threads. |
 | Human text does not reach Codex | Check Message Content Intent, `allowedUserIds`, and that the message is in a linked session thread. |
-| An approval cannot be answered | Check `approverUserIds` and whether the request is still pending. Some prompts require the local client. |
+| An approval cannot be answered | Check `approverUserIds` and the prompt's delivery status. Temporary upload failures recover automatically. Missing command/diff details recover when Codex supplies them; size limits or unsupported prompts require review in the local client. |
+| Discord cannot display a message | The notice explains the rejected format and where the full content is available. Later messages continue. For operators, the log records the rejection; a revised payload or replacement thread restores delivery eligibility. |
 | An old conversation is missing | First attachment exports the active turn and future work; it does not import the whole prior conversation. |
 | Usage says account limits are unavailable | Check daemon connectivity and whether the account's authentication supports the rate-limit endpoint. Rerun `/codex usage` after reconnecting. |
 | Session token counts are missing or old | Counters update when Codex emits a usage notification. The card shows the last reported snapshot, including after a restart; it does not infer missing usage from transcript length. |

@@ -32,3 +32,19 @@ test('a state directory cannot be used by two runners or silently reassigned to 
     store.claim('guild/channel/socket'); store.release();
   } finally { store.close(); }
 });
+
+test('file sharing has its own roots and bounded configurable upload/cache limits', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-config-')); dirs.push(dir);
+  const path = join(dir, 'config.json');
+  const base = { guildId: '100000000000000001', channelId: '100000000000000002', allowedUserIds: ['100000000000000003'],
+    approverUserIds: ['100000000000000003'], projectRoots: ['/root/dev'] };
+  await Bun.write(path, JSON.stringify(base));
+  expect((await readConfig(path)).artifacts).toMatchObject({ enabled: true, roots: [], maxFiles: 4 });
+  await Bun.write(path, JSON.stringify({ ...base, artifacts: { enabled: false, roots: ['/tmp/reports'], maxFiles: 2 } }));
+  expect((await readConfig(path)).artifacts).toMatchObject({ enabled: false, roots: ['/tmp/reports'], maxFiles: 2 });
+  for (const artifacts of [{ enabled: 'yes' }, { roots: ['relative'] }, { maxFiles: 9 }, { maxFileBytes: -1 },
+    { maxTotalBytes: 30 * 1024 * 1024 }, { cacheBytes: 1 }, { retentionDays: 0 }]) {
+    await Bun.write(path, JSON.stringify({ ...base, artifacts }));
+    await expect(readConfig(path)).rejects.toThrow();
+  }
+});

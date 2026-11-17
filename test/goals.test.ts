@@ -47,7 +47,7 @@ function fixture(path = ':memory:') {
   const store = new Store(path); store.saveBinding(binding);
   const codex = new GoalCodex();
   const sent: Delivery[] = []; const edits: { id: string; delivery: Delivery }[] = [];
-  const chat = { createThread: async () => 'channel', send: async (_channel: string, delivery: Delivery) => {
+  const chat = { checkThread: async () => {}, createThread: async () => 'channel', send: async (_channel: string, delivery: Delivery) => {
     sent.push(delivery); return `message-${sent.length}`;
   }, edit: async (_channel: string, id: string, delivery: Delivery) => { edits.push({ id, delivery }); } };
   const bridge = new Bridge(config, codex, store, chat, () => {});

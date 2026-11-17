@@ -4,5 +4,14 @@
   "allowedUserIds": ["YOUR_DISCORD_USER_ID"],
   "approverUserIds": ["YOUR_DISCORD_USER_ID"],
   "autoDiscover": true,
-  "projectRoots": ["/absolute/path/to/your/project"]
+  "projectRoots": ["/absolute/path/to/your/project"],
+  "artifacts": {
+    "enabled": true,
+    "roots": [],
+    "maxFiles": 4,
+    "maxFileBytes": 8388608,
+    "maxTotalBytes": 16777216,
+    "cacheBytes": 134217728,
+    "retentionDays": 7
+  }
 }

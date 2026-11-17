@@ -1,6 +1,20 @@
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
+export interface ArtifactConfig {
+  enabled: boolean;
+  roots: string[];
+  maxFiles: number;
+  maxFileBytes: number;
+  maxTotalBytes: number;
+  cacheBytes: number;
+  retentionDays: number;
+}
+export const defaultArtifacts: ArtifactConfig = {
+  enabled: true, roots: [], maxFiles: 4, maxFileBytes: 8 * 1024 * 1024,
+  maxTotalBytes: 16 * 1024 * 1024, cacheBytes: 128 * 1024 * 1024, retentionDays: 7,
+};
+
 export interface Config {
   guildId: string;
   channelId: string;
@@ -10,6 +24,7 @@ export interface Config {
   projectRoots: string[];
   socketPath: string;
   stateDir: string;
+  artifacts?: ArtifactConfig;
 }
 export function defaultSocket(): string {
   return join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'app-server-control/app-server-control.sock');
@@ -37,7 +52,23 @@ export async function readConfig(path = process.env.DISCORDEX_CONFIG || 'discord
   const stateDir = value.stateDir ?? join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'discordex');
   if (typeof socketPath !== 'string' || !isAbsolute(socketPath)) throw new Error('socketPath must be absolute');
   if (typeof stateDir !== 'string' || !isAbsolute(stateDir)) throw new Error('stateDir must be absolute');
+  const supplied = value.artifacts ?? {};
+  if (typeof supplied !== 'object' || Array.isArray(supplied)) throw new Error('artifacts must be an object');
+  const artifacts: ArtifactConfig = { ...defaultArtifacts, ...supplied };
+  if (typeof artifacts.enabled !== 'boolean') throw new Error('artifacts.enabled must be a boolean');
+  if (!Array.isArray(artifacts.roots) || !artifacts.roots.every((p: unknown) => typeof p === 'string' && isAbsolute(p))) {
+    throw new Error('artifacts.roots must contain absolute paths');
+  }
+  const limits = { maxFiles: 8, maxFileBytes: 20 * 1024 * 1024, maxTotalBytes: 20 * 1024 * 1024,
+    cacheBytes: 1024 * 1024 * 1024, retentionDays: 365 };
+  for (const [key, max] of Object.entries(limits)) {
+    const v = artifacts[key as keyof typeof limits];
+    if (!Number.isSafeInteger(v) || v < 1 || v > max) throw new Error(`artifacts.${key} must be a whole number from 1 to ${max}`);
+  }
+  if (artifacts.maxFileBytes > artifacts.maxTotalBytes || artifacts.maxTotalBytes > artifacts.cacheBytes) {
+    throw new Error('Artifact limits must satisfy maxFileBytes <= maxTotalBytes <= cacheBytes');
+  }
   return { guildId: value.guildId, channelId: value.channelId, allowedUserIds: value.allowedUserIds,
     approverUserIds: value.approverUserIds, autoDiscover: value.autoDiscover ?? true,
-    projectRoots: projectRoots.map((p: string) => resolve(p)), socketPath, stateDir };
+    projectRoots: projectRoots.map((p: string) => resolve(p)), socketPath, stateDir, artifacts };
 }

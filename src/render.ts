@@ -1,6 +1,7 @@
 import type { Approval } from './store.js';
-import { approvalActions } from './approvals.js';
+import { approvalControls, approvalDetails } from './approvals.js';
 import { basename } from 'node:path';
+import { fileReferences } from './file-references.js';
 import type { Binding, Button, Delivery, Item, Packet, TurnState } from './types.js';
 
 export function deliveryNonce(key: string): string {
@@ -67,8 +68,14 @@ export function turnDelivery(binding: Binding, state: TurnState, waiting = false
   }
   const model = state.model;
   const modelLabel = model ? compact(model.name, 70) : undefined;
-  return card(content, { title: binding.label, hideHeader: true, tone,
+  const delivery = card(content, { title: binding.label, hideHeader: true, tone,
     footer: [binding.parentThreadId ? compact(binding.label, 40) : 'Codex', modelLabel, model?.effort, status].filter(Boolean).join(' · ') });
+  if (!active) {
+    const text = (turn.items ?? []).filter(i => completedItemIds.includes(i.id) && visibleMessage(i) && i.phase !== 'commentary').map(i => i.text).join('\n\n');
+    const references = fileReferences(text);
+    if (references.length) delivery.artifactRequest = { cwd: binding.cwd, references };
+  }
+  return delivery;
 }
 export function approvalDelivery(approval: Approval, binding?: Binding): Delivery {
   const packet: Packet = JSON.parse(approval.packet);
@@ -80,20 +87,30 @@ export function approvalDelivery(approval: Approval, binding?: Binding): Deliver
     p.permissions ? `**Requested permissions**\n${JSON.stringify(p.permissions)}` : ''].filter(Boolean);
   if (packet.method === 'item/fileChange/requestApproval') details.push(p.discordexDiff || 'The proposed diff is unavailable. Review and answer in your local Codex client.');
   if (p.questions) for (const q of p.questions) details.push(`**${q.question}**\n${(q.options ?? []).map((o: any) => `- **${o.label}** — ${o.description}`).join('\n')}`);
-  const actions = approval.state === 'pending' ? approvalActions(packet) : [];
+  const review = approvalDetails(packet);
+  // This is a proposed delivery. The receipt separately records whether Discord received the review.
+  const actions = approvalControls(approval, 'ready');
   const permissions = packet.method === 'item/permissions/requestApproval';
   const labels = { accept: permissions ? 'Allow for this turn' : 'Approve once', decline: permissions ? 'Deny' : 'Decline', cancel: 'Cancel turn', answer: 'Answer' };
   const buttons: Button[] = actions.map(action => ({ id: `dx:${approval.token}:${action}`, label: labels[action],
     style: action === 'accept' ? 'success' : action === 'cancel' ? 'secondary' : action === 'decline' ? 'danger' : 'primary' }));
   if (approval.state === 'pending' && !actions.length) {
-    if (packet.method === 'item/tool/requestUserInput') {
+    if (review === 'loading') {
+      details.push('Waiting for the review details from Codex. Controls will appear when the details are available.');
+    } else if (packet.method === 'item/tool/requestUserInput') {
       details.push('Answer this request in the local Codex client.');
     } else if (['item/commandExecution/requestApproval', 'item/fileChange/requestApproval'].includes(packet.method!)) {
       details.push('Use the local Codex client for this approval type.');
     } else details.push('This request type requires the local Codex client.');
-  } else if (approval.state !== 'pending') details.push(`**${approval.state === 'expired' ? 'Connection changed. Use a newly replayed prompt or the local client.' : approval.state === 'submitted' ? 'Decision submitted; waiting for Codex.' : 'Resolved in Codex.'}**`);
+  } else if (approval.state !== 'pending') details.push(`**${approval.state === 'expired' ? 'Connection changed. Use a newly replayed prompt or the local client.' : approval.state === 'uncertain' ? 'Decision delivery could not be confirmed. Waiting for Codex to replay or resolve the request; the decision will not be sent again automatically.' : approval.state === 'submitted' ? 'Decision submitted; waiting for Codex.' : 'Resolved in Codex.'}**`);
   const title = approval.state === 'pending' ? (packet.method === 'item/tool/requestUserInput' ? 'Your input is needed' : 'Approval needed')
-    : approval.state === 'submitted' ? 'Response submitted' : approval.state === 'expired' ? 'Prompt expired' : 'Prompt resolved';
-  return card(details.join('\n\n'), { title, subtitle: binding?.label ?? 'Codex',
+    : approval.state === 'submitted' ? 'Response submitted' : approval.state === 'uncertain' ? 'Response unconfirmed' : approval.state === 'expired' ? 'Prompt expired' : 'Prompt resolved';
+  const delivery = card(details.join('\n\n'), { title, subtitle: binding?.label ?? 'Codex',
     tone: approval.state === 'pending' ? 'warning' : approval.state === 'resolved' ? 'success' : 'neutral' }, 'approval.txt', buttons);
+  // Approval details must describe the exact action, including executable, cwd,
+  // file targets, and network scope. Reference hiding is for ordinary output.
+  delivery.preserveReferences = true;
+  delivery.approvalReview = { token: approval.token, state: review === 'ready' ? 'ready' : 'unavailable' };
+  if (delivery.file && buttons.length) delivery.file.requiredForActions = true;
+  return delivery;
 }

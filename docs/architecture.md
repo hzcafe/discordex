@@ -20,9 +20,13 @@ Standard `node:` compatibility modules and `ws` are used where needed by the tra
 
 ## Session discovery
 
-Discordex connects to the configured daemon socket and lists loaded Codex sessions. Automatic discovery periodically checks for eligible sessions within `projectRoots`; an empty list permits all projects. `/codex sessions` lists eligible sessions, and `/codex attach` links one explicitly.
+Discordex connects to the configured daemon socket and lists loaded Codex sessions. Automatic discovery periodically checks for eligible sessions within `projectRoots`; an empty list permits all projects. `/codex sessions` lists eligible sessions, and `/codex attach` links one explicitly. Scheduled sync requests coalesce while a sync is queued or running, so slow polls do not accumulate duplicate work ahead of incoming instructions. An individual sync still shares the serial queue with those instructions.
 
 Each top-level Codex conversation maps to one Discord thread under the configured text channel. Subagents join the parent's thread and retain their own labels. The mapping is stored in SQLite so reconnects can reuse the same Discord thread.
+
+If Discord confirms that a linked thread was deleted, Discordex creates a replacement and moves the parent session and its subagents to it. Deletion events, delivery failures, periodic history checks, and explicit attachment can trigger recovery, including deletions missed while the bridge was offline. Archived, unlocked threads are reopened when needed; permission failures and temporary network errors do not create replacements. Deleting the configured parent channel requires restoring or reconfiguring that channel.
+
+Replacement preserves Codex sessions, goals, queued inputs, pending replies, current turn cards, and live approval controls. It does not stop or restart Codex, and it does not replay previously delivered conversation history. The replacement starter is persisted before rebinding so a restart can reuse it. As with ordinary sends, a crash before recording a successful Discord response is subject to the finite nonce-deduplication window.
 
 The first attachment includes a currently active turn and future activity, without copying the whole old conversation. Tracked sessions are reattached on reconnect and their history is read from the last processed turn. This can keep those conversations loaded in the shared daemon while Discordex is running.
 
@@ -35,6 +39,8 @@ An allowed user's message in a linked thread is persisted in the inbox and submi
 Normal messages queue work. `/codex steer` adds instructions to the active turn, and `/codex stop` interrupts it. The index channel is not forwarded; bots and webhooks are ignored.
 
 Codex notifications update durable turn state. The outbox delivers changes through the Discord adapter. A serial work queue coordinates bridge operations, while persisted state lets recovery rebuild deliveries from daemon history.
+
+Final assistant replies carry document/media references parsed from Markdown, before inline truncation. Before delivery, an attachment preparation layer resolves permitted host files and persists immutable snapshots and outcomes in SQLite. Binary snapshots have a bounded cache, with pending deliveries protected from eviction. Discord attachment IDs are retained across message edits, and delivery revision/generation checks prevent an asynchronously prepared older reply from being sent after a newer revision or thread replacement. See [automatic file sharing](file-sharing.md).
 
 ## Turn cards and model labels
 
@@ -64,7 +70,11 @@ Uncertain incoming submissions are reconciled against the daemon queue and histo
 
 Reconnects invalidate old approval controls. Only requests replayed by Codex receive fresh controls; resolution in the local client also removes Discord controls. See [approval behavior](configuration.md#approval-behavior) for supported decisions and local-only cases.
 
-State and transcripts remain on disk. Automatic pruning is not implemented, and deleting the state directory resets mappings and delivery history.
+State and transcripts remain on disk. Automatic pruning of conversation records is not implemented; the attachment cache limit does not bound the rest of the database. Deleting the state directory resets mappings and delivery history.
+
+Network and access failures retry with backoff. For known temporary upload failures, the adapter first delivers text with a status notice and reports a partial-delivery receipt. The outbox retains the original desired payload, message ID, and retry schedule, and automatically edits that message when attachments recover. Partial deliveries never hold up later messages in their channel. Backoff increases to at most five minutes; retries survive restart and do not submit approval decisions.
+
+Definitive invalid-payload rejections quarantine the exact failed revision, retaining its payload and error without blocking later output in the thread. A separate notice explains the unavailable content and where it can be reviewed, and `/codex status` counts quarantined deliveries. A revised payload or replacement thread restores eligibility. Known size/format failures are not repeatedly uploaded unchanged. Failed warning notices are retained without recursively generating more warnings. Delivery recovery requires no user command.
 
 ## State and lifecycle invariants
 
@@ -73,9 +83,12 @@ The bridge has several separate state machines. Their transitions use daemon evi
 | State owner | States and invariants |
 | --- | --- |
 | Incoming messages | `new` → `submitting` → `queued` or `unknown`; matching queue entries recover uncertain acceptance, and matching history marks an input `delivered`. An accepted input disappearing from the queue is not evidence that it failed: another client may have consumed it. |
-| Approval prompts | `pending` → `submitted` → `resolved`, with `expired` when the connection changes or submission becomes uncertain. Only a pending prompt in the current connection epoch accepts an offered decision. Rendering and submission use the same approval rules. |
-| Turn cards | `inProgress` becomes `completed`, `interrupted`, or `failed`. Late activity cannot reopen a terminal turn; late completed assistant items can still repair its final text. |
-| Outbox | A successful send or edit acknowledges only the revision that was sent. Changes made during delivery stay pending, and further progress updates preserve retry backoff. |
+| Approval lifecycle | `pending` → `submitted` → `resolved`. A failed write becomes `uncertain` while still on the same connection; only a fresh daemon request replay can restore `pending`. Disconnect expires unresolved prompts, and a fresh connection uses fresh tokens. Terminal prompts never reopen. Write errors/timeouts retire the socket to obtain authoritative replays; decisions are never automatically resent. |
+| Approval review details | `loading`, `ready`, or `unsupported`, derived from the request and known item details. Missing commands/diffs disable actions. Later item events, reconciliation, and same-ID replays fill missing details and revise the same prompt without replacing already reviewed action details. |
+| Approval review delivery | Persisted `pending`, `ready`, or `unavailable`, independent of the lifecycle. Proposed cards use the shared eligibility rule; the adapter returns the actual review-delivery outcome. Receipts update readiness only for the current revision and channel generation. Clicks and modals require a pending request with ready details and a successfully delivered review. Temporary upload failures retain an automatic delivery retry; size/format rejections explain the specific limitation. |
+| Turn cards | `inProgress` becomes `completed`, `interrupted`, or `failed`. Completion and related approval resolution are applied before optional history hydration; hydration failures leave the history checkpoint unchanged for retry. Late activity cannot reopen a terminal turn; late completed assistant items can still repair its final text. |
+| Outbox | Pending delivery, retry backoff, partial delivery awaiting attachments, successful delivery, and quarantined rejection are distinct outcomes. A successful send or edit acknowledges only the revision that was sent. Partial receipts preserve the message ID and desired payload while scheduling a retry without blocking the channel. Changes made during delivery stay pending; stale receipts/failures cannot delay or overwrite a newer revision. Further progress updates preserve ordinary transient retry backoff; revised partial deliveries can proceed immediately. |
+| Deleted threads and cards | Thread replacement moves all linked agents, approvals, and outbox destinations in one transaction. Delivery generations prevent old in-flight results from acknowledging replacement messages. A deleted bot card is resent on its next failed update, using a fresh, persisted nonce generation. |
 | Codex connection | Only the current socket can dispatch events or change connection state. Stop rejects pending requests immediately; callbacks from retired sockets cannot affect a replacement connection. |
 | CLI lifecycle | Shutdown prevents startup from continuing after asynchronous preparation or login. It waits for in-flight login before closing Discord, drains accepted work, and attempts every cleanup step even if an earlier step fails. |
 
@@ -105,6 +118,8 @@ Budget edits omit the objective and status to preserve usage accounting. Creatin
 | [`src/render.ts`](../src/render.ts) | Logical output and prompt rendering |
 | [`src/approvals.ts`](../src/approvals.ts) | Supported approval actions shared by rendering and decision validation |
 | [`src/components.ts`](../src/components.ts) | Compact Components V2 cards, footers, attachments, and controls |
+| [`src/uploads.ts`](../src/uploads.ts) | Shared file-count and byte limits for generated and referenced uploads |
+| [`src/references.ts`](../src/references.ts) | Labels for references to attachments included in outgoing messages |
 | [`src/usage.ts`](../src/usage.ts) | Remaining-allowance bars, quota windows, and reported session counters |
 | [`src/goals.ts`](../src/goals.ts) | Shared goal cards, input validation, control versions, and goal RPCs |
 | [`src/store.ts`](../src/store.ts) | SQLite mappings, inbox, outbox, approvals, and turn-card state |

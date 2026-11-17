@@ -3,12 +3,15 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ComponentType, Events, MessageFlags } from 'discord.js';
+import { Collection, ComponentType, ContainerComponent, Events, MessageFlags } from 'discord.js';
 import { DiscordAdapter } from '../src/discord.js';
 import { Bridge } from '../src/bridge.js';
 import { Store } from '../src/store.js';
+import { MissingMessageError, MissingThreadError } from '../src/chat.js';
 import type { Config } from '../src/config.js';
 import type { Binding, CodexPort, Delivery, ThreadGoal } from '../src/types.js';
+import { defaultArtifacts } from '../src/config.js';
+import { approvalDelivery } from '../src/render.js';
 
 test('goal slash command, create modal, budget modal, and clear button operate one shared card with private acknowledgments', async () => {
   const store = new Store(':memory:');
@@ -28,7 +31,7 @@ test('goal slash command, create modal, budget modal, and clear button operate o
   }, respond: async () => {} }) as CodexPort;
   const adapter = new DiscordAdapter(config, store);
   const sent: Delivery[] = []; const edits: { id: string; delivery: Delivery }[] = [];
-  const chat = { createThread: async () => 'thread', send: async (_channel: string, delivery: Delivery) => { sent.push(delivery); return 'goal-message'; },
+  const chat = { checkThread: async () => {}, createThread: async () => 'thread', send: async (_channel: string, delivery: Delivery) => { sent.push(delivery); return 'goal-message'; },
     edit: async (_channel: string, id: string, delivery: Delivery) => { edits.push({ id, delivery }); } };
   const bridge = new Bridge(config, codex, store, chat, () => {});
   (adapter as any).bridge = bridge;
@@ -306,6 +309,7 @@ test('restart reuses an existing Discord thread when its channel is not cached',
   const adapter = new DiscordAdapter(config, store);
   let starts = 0;
   store.setMeta('starter:t1', 'saved-starter');
+  adapter.client.channels.fetch = (async () => ({ isThread: () => true, guildId: 'guild', parentId: 'parent' })) as any;
   (adapter as any).parent = { messages: { fetch: async () => ({
     id: 'saved-starter', hasThread: true, thread: null, startThread: async () => { starts++; },
   }) } };
@@ -313,4 +317,364 @@ test('restart reuses an existing Discord thread when its channel is not cached',
     expect(await adapter.createThread({ id: 't1', cwd: '/work', status: { type: 'idle' } })).toBe('saved-starter');
     expect(starts).toBe(0);
   } finally { await adapter.close(); store.close(); }
+});
+
+function recoveryFixture() {
+  const store = new Store(':memory:');
+  const config: Config = { guildId: 'guild', channelId: 'parent', allowedUserIds: ['alice'], approverUserIds: ['alice'],
+    autoDiscover: false, projectRoots: ['/work'], socketPath: '/unused', stateDir: '/unused' };
+  const adapter = new DiscordAdapter(config, store);
+  const thread = { id: 't1', cwd: '/work', status: { type: 'idle' } };
+  const messages = new Map<string, any>();
+  const channels = new Map<string, any>();
+  const sends: any[] = [];
+  const reads: { id: string; force: boolean }[] = [];
+  const missing = (code: number) => Object.assign(new Error('Not found'), { code, status: 404 });
+  const fetchChannel = async (id: string, options: any) => {
+    reads.push({ id, force: options?.force });
+    if (!channels.has(id)) throw missing(10003);
+    return channels.get(id);
+  };
+  adapter.client.channels.fetch = fetchChannel as any;
+  const parent = {
+    send: async (payload: any) => {
+      sends.push(payload);
+      const id = String(100 + sends.length);
+      const message = { id, hasThread: false, startThread: async () => {
+        message.hasThread = true;
+        channels.set(id, { id, isThread: () => true, guildId: 'guild', parentId: 'parent',
+          messages: { fetch: async () => new Map() } });
+        return { id };
+      } };
+      messages.set(id, message); return message;
+    },
+    messages: { fetch: async ({ message }: { message: string }) => {
+      if (!messages.has(message)) throw missing(10008);
+      return messages.get(message);
+    } },
+  };
+  (adapter as any).parent = parent;
+  return { adapter, store, config, thread, messages, channels, sends, reads, parent, fetchChannel };
+}
+
+test('replacement creation survives a lost binding commit and rotates the nonce when its starter is deleted', async () => {
+  const f = recoveryFixture();
+  let restarted: DiscordAdapter | undefined;
+  try {
+    const replacement = await f.adapter.createThread(f.thread, 'deleted-channel');
+    await f.adapter.close();
+    restarted = new DiscordAdapter(f.config, f.store);
+    (restarted as any).parent = f.parent;
+    restarted.client.channels.fetch = f.fetchChannel as any;
+    expect(await restarted.createThread(f.thread, 'deleted-channel')).toBe(replacement);
+    expect(f.sends).toHaveLength(1);
+    expect(f.reads).toContainEqual({ id: replacement, force: true });
+    f.messages.delete(replacement);
+    expect(await restarted.createThread(f.thread, 'deleted-channel')).toBe(replacement);
+    expect(f.sends).toHaveLength(1);
+    f.channels.delete(replacement);
+    const next = await restarted.createThread(f.thread, 'deleted-channel');
+    expect(next).not.toBe(replacement);
+    expect(f.sends).toHaveLength(2);
+    expect(f.sends[1].nonce).not.toBe(f.sends[0].nonce);
+    expect(await restarted.createThread(f.thread, 'deleted-channel')).toBe(next);
+    expect(f.sends).toHaveLength(2);
+  } finally { await restarted?.close(); await f.adapter.close(); f.store.close(); }
+});
+
+test('saved starter flags cannot resurrect a deleted thread, and a lost create response reuses its surviving thread', async () => {
+  const f = recoveryFixture();
+  try {
+    const original = await f.adapter.createThread(f.thread);
+    f.channels.delete(original); // The starter still reports hasThread.
+    const next = await f.adapter.createThread(f.thread);
+    expect(next).not.toBe(original);
+    expect(f.sends).toHaveLength(2);
+    const send = f.parent.send;
+    f.parent.send = async payload => {
+      const starter = await send(payload);
+      const start = starter.startThread;
+      starter.startThread = async () => { await start(); throw new Error('Response lost'); };
+      return starter;
+    };
+    await expect(f.adapter.createThread(f.thread, next)).rejects.toThrow('Response lost');
+    expect(await f.adapter.createThread(f.thread, next)).toBe('103');
+    expect(f.sends).toHaveLength(3);
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test('startup polling and duplicate deletion events repair an idle thread even while Codex is offline', async () => {
+  const f = recoveryFixture();
+  f.store.saveBinding({ threadId: 't1', parentThreadId: null, channelId: 'deleted', label: 'Project', cwd: '/work',
+    since: 0, initialTurnId: null, checkpoint: null });
+  const codex = Object.assign(new EventEmitter(), { connected: false, epoch: 'offline',
+    request: async () => { throw new Error('Recovery must not call Codex'); }, respond: async () => {} }) as CodexPort;
+  const bridge = new Bridge(f.config, codex, f.store, f.adapter, () => {});
+  try {
+    f.adapter.connect(bridge);
+    for (let i = 0; i < 100 && f.store.binding('t1')!.channelId === 'deleted'; i++) await Bun.sleep(1);
+    expect(f.store.binding('t1')!.channelId).toBe('101');
+    f.channels.delete('101');
+    const event = { id: '101', guildId: 'guild', parentId: 'parent' } as any;
+    f.adapter.client.emit(Events.ThreadDelete, event); f.adapter.client.emit(Events.ThreadDelete, event);
+    await bridge.serial(async () => {});
+    expect(f.store.binding('t1')!.channelId).toBe('102');
+    expect(f.sends).toHaveLength(2);
+    await f.adapter.catchUp();
+    expect(f.sends).toHaveLength(2);
+  } finally { await f.adapter.close(); await bridge.stop(); f.store.close(); }
+});
+
+test('only specific Discord 404s trigger replacement; archived threads stay reusable and access errors stay errors', async () => {
+  const f = recoveryFixture();
+  try {
+    await expect(f.adapter.checkThread('missing')).rejects.toBeInstanceOf(MissingThreadError);
+    for (const error of [Object.assign(new Error('Missing Access'), { code: 50001, status: 403 }),
+      Object.assign(new Error('Missing Permissions'), { code: 50013, status: 403 }),
+      Object.assign(new Error('Forbidden'), { code: 10003, status: 403 }),
+      Object.assign(new Error('Proxy error'), { status: 404 }), new Error('Network failed')]) {
+      f.adapter.client.channels.fetch = (async () => { throw error; }) as any;
+      await expect(f.adapter.checkThread('missing')).rejects.toBe(error);
+    }
+    f.adapter.client.channels.fetch = f.fetchChannel as any;
+    let activations = 0;
+    const channel = { isThread: () => true, guildId: 'guild', parentId: 'parent', archived: true, locked: false,
+      setArchived: async () => { activations++; channel.archived = false; },
+      send: async () => ({ id: 'sent' }), messages: { edit: async () => { throw Object.assign(new Error('Deleted card'), { code: 10008, status: 404 }); } } };
+    f.channels.set('archived', channel);
+    await f.adapter.checkThread('archived'); expect(activations).toBe(0);
+    await f.adapter.send('archived', { content: 'hello' }, 'nonce'); expect(activations).toBe(1);
+    await expect(f.adapter.edit('archived', 'deleted-card', { content: 'latest' })).rejects.toBeInstanceOf(MissingMessageError);
+    channel.send = async () => { throw Object.assign(new Error('Thread removed after fetch'), { code: 10003, status: 404 }); };
+    await expect(f.adapter.send('archived', { content: 'hello' }, 'nonce')).rejects.toBeInstanceOf(MissingThreadError);
+    expect(f.sends).toHaveLength(0);
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test('Discord attachment IDs survive adapter restart, text edits retain files, and missing attachments are reuploaded', async () => {
+  const f = recoveryFixture();
+  const data = Buffer.from('# Plan'); const hash = new Bun.CryptoHasher('sha256').update(data).digest('hex');
+  f.store.saveArtifact('artifact', 'reply', '{}', hash, data, 1000);
+  const delivery: Delivery = { content: '[Plan](/work/docs/plan.md)', artifacts: [{ hash, name: 'plan.md', kind: 'file', size: data.length,
+    references: ['/work/docs/plan.md'] }] };
+  let current = new Collection<string, any>();
+  const sends: any[] = []; const edits: any[] = [];
+  let nextId = 0;
+  const record = (payload: any) => {
+    current = new Collection((payload.attachments ?? []).map((a: any) => [a.id, { id: a.id, name: a.filename }]));
+    for (const file of payload.files) { const id = String(++nextId); current.set(id, { id, name: file.name }); }
+    return { id: 'reply', attachments: current };
+  };
+  const channel = { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => { sends.push(payload); return record(payload); },
+    messages: { fetch: async () => ({ id: 'reply', attachments: current }),
+      edit: async (_id: string, payload: any) => { edits.push(payload); return record(payload); } } };
+  f.channels.set('thread', channel);
+  let restarted: DiscordAdapter | undefined;
+  try {
+    await f.adapter.send('thread', delivery, 'nonce');
+    expect(sends[0].files).toHaveLength(1);
+    expect(JSON.stringify(sends[0].components)).toContain('Plan — `plan.md`');
+    restarted = new DiscordAdapter(f.config, f.store); restarted.client.channels.fetch = f.fetchChannel as any;
+    await restarted.edit('thread', 'reply', { ...delivery, content: 'Updated text' });
+    expect(edits[0].files).toHaveLength(0);
+    expect(edits[0].attachments).toEqual([{ id: '1', filename: 'plan.md' }]);
+    current.clear();
+    await restarted.edit('thread', 'reply', delivery);
+    expect(edits[1].files).toHaveLength(1); expect(edits[1].attachments).toEqual([]);
+    f.store.db.query('DELETE FROM artifact_blobs').run();
+    await restarted.edit('thread', 'reply', delivery);
+    expect(edits[2].files).toHaveLength(0);
+    expect(edits[2].attachments).toEqual([{ id: '2', filename: 'plan.md' }]);
+    expect(JSON.stringify(edits[2].components)).toContain('Plan — `plan.md`');
+    current.clear();
+    await restarted.edit('thread', 'reply', delivery);
+    expect(edits[3].files).toHaveLength(0);
+    expect(edits[3].attachments).toEqual([]);
+    expect(JSON.stringify(edits[3].components)).toContain(delivery.content);
+  } finally { await restarted?.close(); await f.adapter.close(); f.store.close(); }
+});
+
+test.each(['file', 'image', 'video'] as const)('V2 %s attachments survive edits and cache expiry without reuploading', async kind => {
+  const f = recoveryFixture();
+  const name = kind === 'file' ? 'plan.md' : kind === 'image' ? 'shot.png' : 'demo.mp4';
+  const data = Buffer.from('saved file');
+  const hash = new Bun.CryptoHasher('sha256').update(data).digest('hex');
+  f.store.saveArtifact('artifact', 'reply', '{}', hash, data, 1000);
+  const delivery: Delivery = { content: 'Attached', artifacts: [{ hash, name, kind, size: data.length }] };
+  const media = { attachment_id: '12345', url: `https://cdn.discordapp.com/attachments/thread/12345/${name}?ex=expired` };
+  const current = { id: 'reply', attachments: new Collection(), components: [new (ContainerComponent as any)({ type: 17,
+    components: [kind === 'file' ? { type: 13, file: media } : { type: 12, items: [{ media }] }] })] };
+  const edits: any[] = [];
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent', send: async () => current,
+    messages: { fetch: async () => current, edit: async (_id: string, payload: any) => { edits.push(payload); return current; } } });
+  try {
+    await f.adapter.send('thread', delivery, 'nonce');
+    await f.adapter.edit('thread', 'reply', { ...delivery, content: 'Revised' });
+    expect(edits[0].files).toHaveLength(0);
+    expect(edits[0].attachments).toEqual([{ id: '12345', filename: name }]);
+    f.store.db.query('DELETE FROM artifact_blobs').run();
+    await f.adapter.edit('thread', 'reply', delivery);
+    expect(edits[1].files).toHaveLength(0);
+    expect(edits[1].attachments).toEqual([{ id: '12345', filename: name }]);
+    expect(JSON.stringify(edits[1].components)).not.toContain('expired');
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test('generated reply files obey configured byte limits even when automatic sharing is disabled', async () => {
+  const f = recoveryFixture();
+  f.config.artifacts = { ...defaultArtifacts, enabled: false, maxFileBytes: 10, maxTotalBytes: 12 };
+  const sent: any[] = [];
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => { sent.push(payload); return { id: 'reply', attachments: new Collection() }; } });
+  try {
+    await f.adapter.send('thread', { content: 'Summary\n\nFull text below.', file: { name: 'response.md', content: '🙂'.repeat(3) } }, 'nonce');
+    expect(sent[0].files).toHaveLength(0);
+    expect(JSON.stringify(sent[0].components)).toContain('size limit');
+    expect(JSON.stringify(sent[0].components)).not.toContain('Full text below');
+    expect(JSON.stringify(sent[0].components)).toContain('Summary');
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test('Discord upload-limit failures deliver text with a notice instead of blocking the outbox', async () => {
+  const f = recoveryFixture();
+  const data = Buffer.from('# Plan'); const hash = new Bun.CryptoHasher('sha256').update(data).digest('hex');
+  f.store.saveArtifact('artifact', 'reply', '{}', hash, data, 1000);
+  const sent: any[] = []; const edited: any[] = [];
+  const response = (payload: any) => {
+    if (payload.files.length) throw Object.assign(new Error('Too large'), { status: 413 });
+    return { id: 'message', attachments: new Collection() };
+  };
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => { sent.push(payload); return response(payload); },
+    messages: { edit: async (_id: string, payload: any) => { edited.push(payload); return response(payload); } } });
+  try {
+    const delivery: Delivery = { content: 'Here is the answer [Plan](/work/docs/plan.md)', file: { name: 'response.md', content: 'Long answer' },
+      artifacts: [{ hash, name: 'plan.md', kind: 'file', size: data.length, references: ['/work/docs/plan.md'] }] };
+    expect(await f.adapter.send('thread', delivery, 'nonce')).toBe('message');
+    expect(sent).toHaveLength(2); expect(sent[1].files).toHaveLength(0);
+    expect(JSON.stringify(sent[1].components)).toContain('rejected the file upload');
+    expect(JSON.stringify(sent[1].components)).toContain('Here is the answer');
+    expect(JSON.stringify(sent[0].components)).toContain('Plan — `plan.md`');
+    expect(JSON.stringify(sent[1].components)).toContain(delivery.content);
+    await f.adapter.edit('thread', 'message', delivery);
+    expect(edited).toHaveLength(2); expect(edited[1].files).toHaveLength(0);
+    expect(JSON.stringify(edited[0].components)).toContain('Plan — `plan.md`');
+    expect(JSON.stringify(edited[1].components)).toContain(delivery.content);
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test.each(['size limit', 'Discord rejection'])('approval controls disappear when full review details are lost to %s', async failure => {
+  const f = recoveryFixture();
+  if (failure === 'size limit') f.config.artifacts = { ...defaultArtifacts, maxFileBytes: 10, maxTotalBytes: 12 };
+  const payloads: any[] = [];
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => {
+      payloads.push(payload);
+      if (failure === 'Discord rejection' && payload.files.length) throw Object.assign(new Error('Too large'), { status: 413 });
+      return { id: 'reply', attachments: new Collection() };
+    } });
+  try {
+    const delivery = approvalDelivery({ token: 'prompt', epoch: 'one', rpcId: '1', threadId: 't', channel: 'thread', state: 'pending',
+      packet: JSON.stringify({ id: 1, method: 'item/fileChange/requestApproval', params: { discordexDiff: '+change\n'.repeat(700) } }) });
+    expect(delivery.buttons!.some(b => b.id.endsWith(':accept'))).toBe(true);
+    const receipt = await f.adapter.send('thread', delivery, 'nonce');
+    expect(receipt).toEqual({ id: 'reply', approvalReview: { token: 'prompt', state: 'unavailable' } });
+    const sent = payloads.at(-1);
+    expect(sent.files).toHaveLength(0);
+    expect(JSON.stringify(sent.components)).not.toContain('dx:prompt:accept');
+    expect(JSON.stringify(sent.components)).not.toContain('/codex retry');
+    expect(JSON.stringify(sent.components)).toContain('Open this session in Codex on the host to review and respond');
+    expect(JSON.stringify(sent.components)).toContain(failure === 'size limit' ? 'exceed the attachment size limit' : 'Discord rejected the file');
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test.each(['service', 'network'])('temporary %s upload failure recovers approval controls automatically without blocking later messages', async failure => {
+  const f = recoveryFixture();
+  f.store.saveBinding({ threadId: 't1', channelId: 'thread', parentThreadId: null, label: 'Project', cwd: '/work', since: 0, initialTurnId: null, checkpoint: null });
+  const responses: unknown[] = [];
+  const codex = Object.assign(new EventEmitter(), { connected: true, epoch: 'epoch',
+    request: async () => { throw new Error('Unexpected RPC'); }, respond: async (_id: unknown, value: unknown) => { responses.push(value); } }) as CodexPort;
+  const bridge = new Bridge(f.config, codex, f.store, f.adapter, () => {});
+  (f.adapter as any).bridge = bridge;
+  let rejectReview = true;
+  let attachments = new Collection<string, any>();
+  const payloads: any[] = [];
+  const receive = (payload: any) => {
+    if (rejectReview && payload.files.some((file: any) => file.name === 'approval.txt')) throw Object.assign(new Error('Temporary upload failure'), failure === 'service' ? { status: 503 } : { code: 'ECONNRESET' });
+    payloads.push(payload);
+    attachments = new Collection(payload.files.map((file: any, i: number) => [String(i), { id: String(i), name: file.name }]));
+    return { id: 'message', attachments };
+  };
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => receive(payload), messages: {
+      fetch: async () => ({ id: 'message', attachments }), edit: async (_id: string, payload: any) => receive(payload),
+    } });
+  try {
+    await bridge.serverRequest({ id: 1, method: 'item/commandExecution/requestApproval', params: {
+      threadId: 't1', command: 'git status', reason: 'Review context. '.repeat(400), availableDecisions: ['accept', 'decline'],
+    } });
+    await Bun.sleep(0); await bridge.flush();
+    const a = f.store.pendingApprovals()[0]!;
+    expect(a.reviewDelivery).toBe('unavailable');
+    expect(JSON.stringify(payloads.at(-1).components)).not.toContain(`dx:${a.token}:accept`);
+    expect(JSON.stringify(payloads.at(-1).components)).toContain('retrying automatically');
+    expect(JSON.stringify(payloads.at(-1).components)).not.toContain('/codex retry');
+    await expect(bridge.decide(a.token, 'accept', 'thread', 'alice')).rejects.toThrow('not been delivered');
+    const partial = f.store.db.query<{ pending: number; partial: number; attempts: number; nextAttempt: number }, []>('SELECT pending, partial, attempts, nextAttempt FROM outbox').get()!;
+    expect(partial).toMatchObject({ pending: 1, partial: 1, attempts: 1 });
+    expect(partial.nextAttempt).toBeGreaterThan(Date.now());
+    const count = payloads.length;
+    await bridge.flush();
+    expect(payloads).toHaveLength(count);
+    f.store.enqueue('later', 'thread', { content: 'Later message' });
+    await bridge.flush();
+    expect(JSON.stringify(payloads.at(-1).components)).toContain('Later message');
+    expect(responses).toHaveLength(0);
+    rejectReview = false;
+    f.store.db.query('UPDATE outbox SET nextAttempt = 0').run();
+    await bridge.flush();
+    expect(f.store.approval(a.token)!.reviewDelivery).toBe('ready');
+    expect(JSON.stringify(payloads.at(-1).components)).toContain(`dx:${a.token}:accept`);
+    expect(f.store.db.query<{ partial: number; pending: number }, [string]>('SELECT partial, pending FROM outbox WHERE key = ?').get(`approval:${a.token}`)).toEqual({ partial: 0, pending: 0 });
+    await bridge.decide(a.token, 'accept', 'thread', 'alice');
+    expect(responses).toEqual([{ decision: 'accept' }]);
+  } finally { await bridge.stop(); await f.adapter.close(); f.store.close(); }
+});
+
+test('ordinary attachments retry on the same message and replace file references only after recovery', async () => {
+  const f = recoveryFixture();
+  const data = Buffer.from('# Original plan'); const hash = new Bun.CryptoHasher('sha256').update(data).digest('hex');
+  f.store.saveArtifact('artifact', 'reply', '{}', hash, data, 1000);
+  const delivery: Delivery = { content: '[Plan](/work/docs/plan.md)', artifacts: [
+    { hash, name: 'plan.md', kind: 'file', size: data.length, references: ['/work/docs/plan.md'] },
+  ] };
+  const codex = Object.assign(new EventEmitter(), { connected: false, epoch: 'e', request: async () => {}, respond: async () => {} }) as CodexPort;
+  const bridge = new Bridge(f.config, codex, f.store, f.adapter, () => {});
+  let fail = true;
+  const sent: any[] = []; const edited: any[] = [];
+  const receive = (payload: any) => {
+    if (fail && payload.files.length) throw Object.assign(new Error('Upload unavailable'), { status: 503 });
+    return { id: 'reply-message', attachments: new Collection(payload.files.map((file: any, i: number) => [String(i), { id: String(i), name: file.name }])) };
+  };
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => { const result = receive(payload); sent.push(payload); return result; },
+    messages: { edit: async (id: string, payload: any) => { expect(id).toBe('reply-message'); const result = receive(payload); edited.push(payload); return result; } } });
+  try {
+    f.store.enqueue('reply', 'thread', delivery);
+    await bridge.flush();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].files).toHaveLength(0);
+    expect(JSON.stringify(sent[0].components)).toContain(delivery.content);
+    expect(JSON.stringify(sent[0].components)).toContain('retrying automatically');
+    expect(f.store.messageId('reply')).toBe('reply-message');
+    fail = false;
+    f.store.db.query('UPDATE outbox SET nextAttempt = 0').run();
+    await bridge.flush();
+    expect(sent).toHaveLength(1);
+    expect(edited).toHaveLength(1);
+    expect(JSON.stringify(edited[0].components)).toContain('Plan — `plan.md`');
+    expect(Buffer.from(edited[0].files[0].attachment).toString()).toBe('# Original plan');
+    expect(f.store.outgoing()).toHaveLength(0);
+  } finally { await bridge.stop(); await f.adapter.close(); f.store.close(); }
 });

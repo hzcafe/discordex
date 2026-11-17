@@ -133,11 +133,14 @@ Every allowed user's text in a linked thread reaches Codex, including discussion
 
 Each agent turn gets **one message that keeps updating**: working, running a command, editing files, completed commentary, then the final response. Longer final answers include the full text as a file attachment. Approval prompts have separate cards so progress updates never hide a pending decision. Partial token streams and private reasoning text are not exported.
 
+Temporary upload failures recover automatically on the same message, without holding up later messages. A delivery notice explains when files are still arriving or when a size or format limit prevents sharing them in Discord.
+
 ## Documentation
 
 | Guide | Covers |
 | --- | --- |
 | [Configuration and hosting](docs/configuration.md) | Settings, contributor and approver access, Linux service, and troubleshooting |
+| [Automatic file sharing](docs/file-sharing.md) | Referenced documents, inline media, sharing roots, and attachment limits |
 | [Architecture](docs/architecture.md) | Bun/TypeScript stack, daemon discovery, editable cards, persistence, and recovery limits |
 | [Development](#development) | Local checks, source map, and protocol updates |
 
@@ -157,7 +160,7 @@ Yes. Discordex attaches to the shared daemon alongside your local client. It dis
 
 ### Are images and voice supported?
 
-Not yet. Input attachments and voice messages are not ingested; only accompanying text is forwarded. Long text responses can be attached as files, but image previews are not implemented.
+Final replies can share referenced images and videos as inline media, and documents as downloadable files without text excerpts. See [automatic file sharing](docs/file-sharing.md). Input attachments and voice messages are not ingested; only accompanying text is forwarded.
 
 ### Can I see or change the model in Discord?
 
