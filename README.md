@@ -61,13 +61,17 @@ Read the [Discordex architecture guide](https://github.com/hzcafe/discordex/blob
 
 ### 1. Prepare your host and Discord bot
 
-You need **Bun 1.3+** (developed and tested with **1.4.4**), **Codex 0.169.0** with its shared app-server daemon, and a Discord server with a text channel for the bot. Older Codex releases are not assumed compatible. A Linux user-service example is included.
+You need **Codex 0.169.0** with its shared app-server daemon, and a Discord server with a text channel for the bot. Source installs also require **Bun 1.3+** (tested with **1.4.4**). Older Codex releases are not assumed compatible. A Linux user-service example is included.
 
 - Create an application and bot in the [Discord Developer Portal](https://discord.com/developers/applications). Enable **Message Content Intent** on the bot settings page.
 - Invite it with the `bot` and `applications.commands` scopes and these channel permissions: **View Channel**, **Send Messages**, **Create Public Threads**, **Send Messages in Threads**, **Read Message History**, **Attach Files**, and **Add Reactions**. Administrator is not required.
 - Enable Discord's Developer Mode and copy your server, text-channel, and user IDs.
 
 ### 2. Install and configure
+
+Prebuilt archives for Linux (glibc) and macOS include the Bun runtime, native image libraries, and example configuration. Download the x64 or ARM64 archive for your host, extract it, and keep the executable and its `lib/` directory together. In the extracted directory, copy `.env.example` to `.env` and `discordex.config.example.json` to `discordex.config.json`. For step 3, use `./discordex doctor` and `./discordex start`. The shared Codex daemon must be installed separately. Automatic uploads of referenced project files currently require Linux’s `/proc/self/fd` checks. [Download a release](https://github.com/hzcafe/discordex/releases)
+
+To run from source with Bun:
 
 ```sh
 git clone https://github.com/hzcafe/discordex.git
@@ -190,6 +194,8 @@ bun run check
 bun test
 bun run build
 ```
+
+Each successful push to the default branch publishes a GitHub Release tagged with the commit ID. Each of the four native runners extracts its archive and runs the packaged `doctor` against a test daemon. Releases include SHA-256 checksums. To build and check an archive for your own host, run `bun run build:release` followed by `bun scripts/smoke-release.ts`.
 
 Use `bun dev` for watch mode. The build produces a Bun-targeted entry point in `dist/`; production can also run the TypeScript source directly. **Node.js is not a runtime dependency.**
 

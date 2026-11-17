@@ -9,6 +9,7 @@
   "packageManager": "bun@1.4.4",
   "scripts": {
     "build": "bun build src/cli.ts --target=bun --packages=external --outdir=dist",
+    "build:release": "bun scripts/build-release.ts",
     "check": "tsc --noEmit",
     "test": "bun test",
     "dev": "bun --watch src/cli.ts start",
