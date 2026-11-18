@@ -22,7 +22,7 @@ function selectedEffort(model: ModelOption | undefined, preferred: string | null
   const options = model?.supportedReasoningEfforts ?? [];
   return options.find(o => o.reasoningEffort === preferred)?.reasoningEffort
     ?? options.find(o => o.reasoningEffort === model?.defaultReasoningEffort)?.reasoningEffort
-    ?? options[0]?.reasoningEffort ?? null;
+    ?? null;
 }
 function index(value: string | undefined, length: number): number {
   if (!value || !/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) >= length) throw new Error('Unknown model or effort selection. Run `/codex model` again.');
@@ -72,7 +72,8 @@ export class Models {
     const selected = models.findIndex(m => m.model === current.model);
     const picker: ModelPicker = { token: crypto.randomUUID(), revision: 0, userId, threadId: binding.threadId,
       channelId: binding.channelId, epoch, expiresAt: Date.now() + 15 * 60_000, current, models, selected,
-      effort: selectedEffort(models[selected], current.effort), page: Math.max(0, Math.floor(selected / 25)), notice };
+      effort: models[selected]?.supportedReasoningEfforts.find(o => o.reasoningEffort === current.effort)?.reasoningEffort ?? null,
+      page: Math.max(0, Math.floor(selected / 25)), notice };
     this.pickers.set(picker.token, picker);
     return structuredClone(picker);
   }
@@ -123,7 +124,8 @@ export class Models {
         await this.codex.request('thread/settings/update', { threadId: binding.threadId, model: chosen.model,
           ...(picker.effort !== null ? { effort: picker.effort } : {}) });
         const confirmed = await this.read(binding, picker.epoch);
-        if (confirmed.model !== chosen.model || (picker.effort !== null && confirmed.effort !== picker.effort)) throw new Error('Different settings reported');
+        if (confirmed.provider !== current.provider || confirmed.model !== chosen.model ||
+          (picker.effort !== null && confirmed.effort !== picker.effort)) throw new Error('Different settings reported');
         return this.remember(binding, userId, picker.epoch, confirmed, models, 'Saved for subsequent turns. Any current turn keeps its existing settings.');
       } catch {
         throw new Error('Could not confirm the model change. Run `/codex model` to check the current settings before trying again.');
@@ -154,9 +156,9 @@ export function modelPickerPayload(picker: ModelPicker) {
   if (pages > 1) buttons.addComponents(
     new ButtonBuilder().setCustomId(id('prev')).setLabel('Previous').setStyle(ButtonStyle.Secondary).setDisabled(!picker.page),
     new ButtonBuilder().setCustomId(id('next')).setLabel('Next').setStyle(ButtonStyle.Secondary).setDisabled(picker.page === pages - 1));
-  const current = `${picker.current.model ?? 'Unknown'} · ${picker.current.effort ?? 'Default effort'}`;
+  const current = `${picker.current.model ?? 'Unknown model'} · ${picker.current.effort ?? 'Effort not reported'}`;
   const offPage = selected && Math.floor(picker.selected / 25) !== picker.page
-    ? `\nSelected: ${escapeMarkdown(compact(`${selected.displayName || selected.model} · ${picker.effort ?? 'No reasoning options'}`, 160))}` : '';
+    ? `\nSelected: ${escapeMarkdown(compact(`${selected.displayName || selected.model} · ${picker.effort ?? 'No effort selected'}`, 160))}` : '';
   const container = new ContainerBuilder().setAccentColor(0x7289da)
     .addTextDisplayComponents(new TextDisplayBuilder().setContent(`**Session model**\nCurrent: ${escapeMarkdown(compact(current, 160))}${offPage}\n${picker.notice ?? 'Choose a model and effort, then Apply. Changes affect subsequent turns.'}`))
     .addActionRowComponents(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(modelMenu))

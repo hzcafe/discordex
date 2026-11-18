@@ -376,6 +376,8 @@ test('replacement creation survives a lost binding commit and rotates the nonce 
     const next = await restarted.createThread(f.thread, 'deleted-channel');
     expect(next).not.toBe(replacement);
     expect(f.sends).toHaveLength(2);
+    expect(f.store.getMeta('starter:t1:replacement:deleted-channel:generation')).toBe(
+      `starter:t1:replacement:deleted-channel:after:${replacement}`);
     expect(f.sends[1].nonce).not.toBe(f.sends[0].nonce);
     expect(await restarted.createThread(f.thread, 'deleted-channel')).toBe(next);
     expect(f.sends).toHaveLength(2);
@@ -495,6 +497,27 @@ test('Discord attachment IDs survive adapter restart, text edits retain files, a
   } finally { await restarted?.close(); await f.adapter.close(); f.store.close(); }
 });
 
+test('a temporary edit failure preserves already uploaded files for the outbox retry', async () => {
+  const f = recoveryFixture();
+  const data = Buffer.from('existing attachment');
+  const hash = new Bun.CryptoHasher('sha256').update(data).digest('hex');
+  const attachment = { id: '123', name: 'plan.md' };
+  f.store.setMeta('attachments:thread:reply', JSON.stringify([{ ...attachment, hash }]));
+  const delivery: Delivery = { content: 'Updated', artifacts: [{ hash, name: attachment.name, kind: 'file', size: data.length }] };
+  const error = Object.assign(new Error('Unavailable'), { status: 503 });
+  const edits: any[] = [];
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent', messages: {
+    fetch: async () => ({ id: 'reply', attachments: new Collection([[attachment.id, attachment]]) }),
+    edit: async (_id: string, payload: any) => { edits.push(payload); throw error; },
+  } });
+  try {
+    await expect(f.adapter.edit('thread', 'reply', delivery)).rejects.toBe(error);
+    expect(edits).toHaveLength(1);
+    expect(edits[0].files).toHaveLength(0);
+    expect(edits[0].attachments).toEqual([{ id: attachment.id, filename: attachment.name }]);
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
 test.each(['file', 'image', 'video'] as const)('V2 %s attachments survive edits and cache expiry without reuploading', async kind => {
   const f = recoveryFixture();
   const name = kind === 'file' ? 'plan.md' : kind === 'image' ? 'shot.png' : 'demo.mp4';
@@ -502,9 +525,9 @@ test.each(['file', 'image', 'video'] as const)('V2 %s attachments survive edits 
   const hash = new Bun.CryptoHasher('sha256').update(data).digest('hex');
   f.store.saveArtifact('artifact', 'reply', '{}', hash, data, 1000);
   const delivery: Delivery = { content: 'Attached', artifacts: [{ hash, name, kind, size: data.length }] };
-  const media = { attachment_id: '12345', url: `https://cdn.discordapp.com/attachments/thread/12345/${name}?ex=expired` };
+  const media = { attachment_id: '12345', url: 'https://cdn.discordapp.com/opaque-media?ex=expired' };
   const current = { id: 'reply', attachments: new Collection(), components: [new (ContainerComponent as any)({ type: 17,
-    components: [kind === 'file' ? { type: 13, file: media } : { type: 12, items: [{ media }] }] })] };
+    components: [kind === 'file' ? { type: 13, name, file: media } : { type: 12, items: [{ media, description: name }] }] })] };
   const edits: any[] = [];
   f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent', send: async () => current,
     messages: { fetch: async () => current, edit: async (_id: string, payload: any) => { edits.push(payload); return current; } } });
@@ -533,6 +556,21 @@ test('generated reply files obey configured byte limits even when automatic shar
     expect(JSON.stringify(sent[0].components)).toContain('size limit');
     expect(JSON.stringify(sent[0].components)).not.toContain('Full text below');
     expect(JSON.stringify(sent[0].components)).toContain('Summary');
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test('generic invalid form errors propagate without resending or editing away files', async () => {
+  const f = recoveryFixture();
+  const error = Object.assign(new Error('Invalid Form Body'), { status: 400, code: 50035 });
+  const calls: any[] = [];
+  const reject = async (payload: any) => { calls.push(payload); throw error; };
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: reject, messages: { edit: (_id: string, payload: any) => reject(payload) } });
+  const delivery = { content: 'Preview', file: { name: 'response.md', content: 'Full answer' } };
+  try {
+    await expect(f.adapter.send('thread', delivery, 'nonce')).rejects.toBe(error);
+    await expect(f.adapter.edit('thread', 'message', delivery)).rejects.toBe(error);
+    expect(calls.map(payload => payload.files.length)).toEqual([1, 1]);
   } finally { await f.adapter.close(); f.store.close(); }
 });
 
@@ -676,5 +714,133 @@ test('ordinary attachments retry on the same message and replace file references
     expect(JSON.stringify(edited[0].components)).toContain('Plan — `plan.md`');
     expect(Buffer.from(edited[0].files[0].attachment).toString()).toBe('# Original plan');
     expect(f.store.outgoing()).toHaveLength(0);
+  } finally { await bridge.stop(); await f.adapter.close(); f.store.close(); }
+});
+
+test.each(['full', 'fallback'])('an accepted %s send with a lost response reconciles the nonce receipt on the same message', async accepted => {
+  const f = recoveryFixture();
+  const delivery = approvalDelivery({ token: 'prompt', epoch: 'one', rpcId: '1', threadId: 't', channel: 'thread', state: 'pending',
+    packet: JSON.stringify({ id: 1, method: 'item/fileChange/requestApproval', params: { discordexDiff: '+change\n'.repeat(700) } }) });
+  const lostResponse = Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' });
+  const response = (payload: any) => ({ id: 'reply', attachments: new Collection<string, any>(
+    payload.files.map((file: any, i: number) => [String(i), { id: String(i), name: file.name }])) });
+  let current: ReturnType<typeof response> | undefined;
+  const edits: any[] = [];
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => {
+      expect(payload.nonce).toBe('nonce');
+      expect(payload.enforceNonce).toBe(true);
+      if (current) return current;
+      if (accepted === 'full' || !payload.files.length) current = response(payload);
+      throw lostResponse;
+    }, messages: {
+      edit: async (id: string, payload: any) => {
+        expect(id).toBe(current!.id);
+        edits.push(payload);
+        return current = response(payload);
+      },
+    } });
+  try {
+    if (accepted === 'fallback') await expect(f.adapter.send('thread', delivery, 'nonce')).rejects.toBe(lostResponse);
+    const receipt = await f.adapter.send('thread', delivery, 'nonce');
+    expect(receipt).toEqual({ id: 'reply', retryAttachments: true, approvalReview: { token: 'prompt', state: 'unavailable' } });
+    expect(await f.adapter.edit('thread', 'reply', delivery)).toEqual({ approvalReview: { token: 'prompt', state: 'ready' } });
+    expect(edits).toHaveLength(1);
+    expect(edits[0].files[0].name).toBe('approval.txt');
+    expect(JSON.stringify(edits[0].components)).toContain('dx:prompt:accept');
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test.each([true, false])('a revised send with a lost receipt edits the saved ID after restart, with files=%s', async withFile => {
+  const dir = mkdtempSync(join(tmpdir(), 'discordex-revision-'));
+  const path = join(dir, 'store.db');
+  const f = recoveryFixture();
+  const codex = Object.assign(new EventEmitter(), { connected: false, epoch: 'epoch',
+    request: async () => {}, respond: async () => {} }) as CodexPort;
+  let store = new Store(path);
+  let adapter = new DiscordAdapter(f.config, store);
+  let bridge = new Bridge(f.config, codex, store, adapter, () => {});
+  const delivery = (text: string): Delivery => ({ content: text, ...(withFile ? { file: { name: 'report.txt', content: text } } : {}) });
+  let accepted: { id: string; attachments: Collection<string, any> } | undefined;
+  const sends: string[] = [];
+  const edits: any[] = [];
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => {
+      sends.push(payload.nonce);
+      expect(payload.enforceNonce).toBe(true);
+      if (accepted) return accepted;
+      accepted = { id: 'reply', attachments: new Collection(payload.files.map((file: any) => ['old', { id: 'old', name: file.name }])) };
+      // Simulate loss after acceptance, before any message ID was persisted.
+      throw new Error('Response lost');
+    }, messages: {
+      edit: async (id: string, payload: any) => {
+        expect(id).toBe('reply');
+        edits.push(payload);
+        return { id, attachments: new Collection(payload.files.map((file: any) => ['new', { id: 'new', name: file.name }])) };
+      },
+    } });
+  try {
+    adapter.client.channels.fetch = f.fetchChannel as any;
+    store.enqueue('reply', 'thread', delivery('Old content'));
+    await bridge.flush();
+    expect(store.messageId('reply')).toBeNull();
+    store.revise('reply', delivery('Updated content'));
+    await bridge.flush();
+    expect(sends).toHaveLength(2);
+    expect(sends[0]).toBe(sends[1]);
+    expect(store.outgoing()[0]).toMatchObject({ message: 'reply', revision: 2 });
+    await bridge.stop(); await adapter.close(); store.close();
+    store = new Store(path);
+    adapter = new DiscordAdapter(f.config, store);
+    adapter.client.channels.fetch = f.fetchChannel as any;
+    bridge = new Bridge(f.config, codex, store, adapter, () => {});
+    await bridge.flush();
+    expect(edits).toHaveLength(1);
+    expect(JSON.stringify(edits[0].components)).toContain('Updated content');
+    expect(edits[0].attachments).toEqual([]);
+    expect(edits[0].files).toHaveLength(withFile ? 1 : 0);
+    if (withFile) expect(Buffer.from(edits[0].files[0].attachment).toString()).toBe('Updated content');
+    expect(sends).toHaveLength(2);
+    expect(store.outgoing()).toHaveLength(0);
+  } finally {
+    await bridge.stop(); await adapter.close(); store.close();
+    await f.adapter.close(); f.store.close(); rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('approval stays unavailable while the edit receipt lacks the required file', async () => {
+  const f = recoveryFixture();
+  const delivery = approvalDelivery({ token: 'prompt', epoch: 'one', rpcId: '1', threadId: 't', channel: 'thread', state: 'pending',
+    packet: JSON.stringify({ id: 1, method: 'item/fileChange/requestApproval', params: { discordexDiff: '+change\n'.repeat(700) } }) });
+  let attachments = new Collection<string, any>();
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    messages: { edit: async () => ({ id: 'reply', attachments }) } });
+  try {
+    expect(await f.adapter.edit('thread', 'reply', delivery)).toEqual({
+      approvalReview: { token: 'prompt', state: 'unavailable' }, retryAttachments: true });
+    attachments.set('123', { id: '123', name: 'approval.txt' });
+    expect(await f.adapter.edit('thread', 'reply', delivery)).toEqual({ approvalReview: { token: 'prompt', state: 'ready' } });
+  } finally { await f.adapter.close(); f.store.close(); }
+});
+
+test('a card coalesced before its first send completes in one request', async () => {
+  const f = recoveryFixture();
+  const codex = Object.assign(new EventEmitter(), { connected: false, epoch: 'epoch',
+    request: async () => {}, respond: async () => {} }) as CodexPort;
+  const bridge = new Bridge(f.config, codex, f.store, f.adapter, () => {});
+  const payloads: any[] = [];
+  f.channels.set('thread', { isThread: () => true, guildId: 'guild', parentId: 'parent',
+    send: async (payload: any) => {
+      payloads.push(payload);
+      return { id: 'reply', attachments: new Collection() };
+    } });
+  try {
+    f.store.enqueue('reply', 'thread', { content: 'Working' });
+    f.store.revise('reply', { content: 'Complete' });
+    await bridge.flush();
+    expect(f.store.outgoing()).toHaveLength(0);
+    expect(f.store.messageId('reply')).toBe('reply');
+    expect(payloads).toHaveLength(1);
+    expect(JSON.stringify(payloads[0].components)).toContain('Complete');
   } finally { await bridge.stop(); await f.adapter.close(); f.store.close(); }
 });

@@ -36,18 +36,26 @@ test('existing databases retain delivery state when deletion recovery is enabled
     message TEXT, pending INTEGER NOT NULL DEFAULT 1, attempts INTEGER NOT NULL DEFAULT 0,
     nextAttempt INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1);
     INSERT INTO outbox (key, channel, payload, message, attempts, revision)
-    VALUES ('reply', 'channel', '{"content":"latest"}', 'original-message', 3, 7);`);
+    VALUES ('reply', 'channel', '{"content":"latest"}', 'original-message', 3, 7),
+      ('unconfirmed', 'other-channel', '{"content":"new"}', NULL, 0, 5);`);
   legacy.close();
   let store: Store | undefined;
   try {
     store = new Store(path);
     const old = store.outgoing()[0]!;
+    const unconfirmed = store.outgoing()[1]!;
+    expect(store.beginSend(unconfirmed)).toBe(1);
     expect(old).toMatchObject({ message: 'original-message', attempts: 3, revision: 7, generation: 0 });
     store.recreateMessage(old);
     store.delivered(old, 'stale-ack'); store.retry(old);
     expect(store.outgoing()[0]).toMatchObject({ message: null, attempts: 0, generation: 1 });
     store.close(); store = new Store(path);
-    expect(store.outgoing()[0]).toMatchObject({ message: null, generation: 1, payload: '{"content":"latest"}' });
+    const replacement = store.outgoing()[0]!;
+    expect(replacement).toMatchObject({ message: null, generation: 1, payload: '{"content":"latest"}' });
+    expect(store.beginSend(replacement)).toBe(replacement.revision);
+    store.replaceChannel('other-channel', 'replacement-channel');
+    const moved = store.outgoing()[1]!;
+    expect(store.beginSend(moved)).toBe(moved.revision);
   } finally { store?.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

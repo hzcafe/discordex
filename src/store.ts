@@ -29,7 +29,7 @@ export class Store {
         key TEXT PRIMARY KEY, channel TEXT NOT NULL, payload TEXT NOT NULL, message TEXT,
         pending INTEGER NOT NULL DEFAULT 1, attempts INTEGER NOT NULL DEFAULT 0,
         nextAttempt INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 1,
-        generation INTEGER NOT NULL DEFAULT 0
+        generation INTEGER NOT NULL DEFAULT 0, firstSendRevision INTEGER
       );
       CREATE TABLE IF NOT EXISTS approvals (
         token TEXT PRIMARY KEY, epoch TEXT NOT NULL, rpcId TEXT NOT NULL, threadId TEXT NOT NULL,
@@ -56,12 +56,15 @@ export class Store {
       const additions = [
         ['outbox', 'generation', 'INTEGER NOT NULL DEFAULT 0'], ['outbox', 'blocked', 'INTEGER NOT NULL DEFAULT 0'],
         ['outbox', 'failure', 'TEXT'], ['approvals', 'reviewDelivery', "TEXT NOT NULL DEFAULT 'pending'"],
-        ['outbox', 'partial', 'INTEGER NOT NULL DEFAULT 0'],
+        ['outbox', 'partial', 'INTEGER NOT NULL DEFAULT 0'], ['outbox', 'firstSendRevision', 'INTEGER'],
         ['inputs', 'images', "TEXT NOT NULL DEFAULT '[]'"],
       ];
       for (const [table, column, definition] of additions) {
         if (!this.db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().some(c => c.name === column)) {
           this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+          // Older databases did not record send attempts. Their nonce could have
+          // been used as early as revision 1, including before a lost response.
+          if (column === 'firstSendRevision') this.db.exec('UPDATE outbox SET firstSendRevision = 1 WHERE message IS NULL');
         }
       }
     })();
@@ -156,7 +159,7 @@ export class Store {
       this.db.query("UPDATE approvals SET channel = ?, reviewDelivery = 'pending' WHERE channel = ?").run(replacement, previous);
       // Keep pending output and current controls, without replaying delivered history.
       this.db.query(`UPDATE outbox SET channel = ?, message = NULL, attempts = 0, nextAttempt = 0,
-        revision = revision + 1, generation = generation + 1, blocked = 0, failure = NULL, partial = 0 WHERE channel = ?`).run(replacement, previous);
+        revision = revision + 1, generation = generation + 1, firstSendRevision = NULL, blocked = 0, failure = NULL, partial = 0 WHERE channel = ?`).run(replacement, previous);
       for (const key of refresh) this.db.query('UPDATE outbox SET pending = 1 WHERE key = ? AND channel = ?').run(key, replacement);
       this.db.query('DELETE FROM meta WHERE key = ?').run(`inbox-cursor:${previous}`);
     })();
@@ -173,11 +176,20 @@ export class Store {
       AND NOT EXISTS (SELECT 1 FROM outbox AS prior WHERE prior.channel = o.channel AND prior.rowid < o.rowid AND prior.pending = 1 AND prior.blocked = 0 AND prior.partial = 0 AND prior.nextAttempt > ?)
       ORDER BY rowid LIMIT 50`).all(Date.now(), Date.now());
   }
+  beginSend(row: Outgoing): number | undefined {
+    return this.db.query<{ firstSendRevision: number }, [string, string, number, number]>(`UPDATE outbox
+      SET firstSendRevision = COALESCE(firstSendRevision, revision)
+      WHERE key = ? AND channel = ? AND generation = ? AND revision = ? AND message IS NULL
+      RETURNING firstSendRevision`).get(row.key, row.channel, row.generation, row.revision)?.firstSendRevision;
+  }
+  rememberMessage(row: Outgoing, id: string): void {
+    this.db.query('UPDATE outbox SET message = ? WHERE key = ? AND channel = ? AND generation = ?')
+      .run(id, row.key, row.channel, row.generation);
+  }
   delivered(row: Outgoing, message: string, review?: Delivery['approvalReview'], retryAttachments = false): void {
     // A resolution may revise an approval while Discord's send is in flight.
     this.db.transaction(() => {
-      this.db.query('UPDATE outbox SET message = ? WHERE key = ? AND channel = ? AND generation = ?')
-        .run(message, row.key, row.channel, row.generation);
+      this.rememberMessage(row, message);
       if (!this.currentDelivery(row)) return;
       if (review && row.key === `approval:${review.token}`) {
         this.db.query("UPDATE approvals SET reviewDelivery = ? WHERE token = ? AND channel = ? AND state = 'pending'")
@@ -214,7 +226,7 @@ export class Store {
   recreateMessage(row: Outgoing): void {
     this.db.transaction(() => {
       const result = this.db.query(`UPDATE outbox SET message = NULL, pending = 1, attempts = 0, nextAttempt = 0,
-        revision = revision + 1, generation = generation + 1, blocked = 0, failure = NULL, partial = 0 WHERE key = ? AND channel = ? AND generation = ?`)
+        revision = revision + 1, generation = generation + 1, firstSendRevision = NULL, blocked = 0, failure = NULL, partial = 0 WHERE key = ? AND channel = ? AND generation = ?`)
         .run(row.key, row.channel, row.generation);
       if (result.changes && row.key.startsWith('approval:')) this.db.query("UPDATE approvals SET reviewDelivery = 'pending' WHERE token = ? AND state = 'pending'").run(row.key.slice('approval:'.length));
     })();
@@ -253,7 +265,11 @@ export class Store {
   resolveApproval(epoch: string, rpcId: unknown): Approval | undefined {
     return this.db.query<Approval, [string, string]>('SELECT * FROM approvals WHERE epoch = ? AND rpcId = ?').get(epoch, JSON.stringify(rpcId)) ?? undefined;
   }
-  hasInput(id: string): boolean { return Boolean(this.db.query('SELECT 1 FROM inputs WHERE id = ?').get(id)); }
+  hasInput(id: string, threadId?: string): boolean {
+    return threadId === undefined
+      ? Boolean(this.db.query('SELECT 1 FROM inputs WHERE id = ?').get(id))
+      : Boolean(this.db.query('SELECT 1 FROM inputs WHERE id = ? AND threadId = ?').get(id, threadId));
+  }
   input(id: string): Input | undefined { return this.db.query<Input, [string]>('SELECT * FROM inputs WHERE id = ?').get(id) ?? undefined; }
   pendingInputs(threadId?: string): Input[] {
     return threadId

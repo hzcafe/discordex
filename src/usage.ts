@@ -48,13 +48,9 @@ function windowLines(window: RateLimitWindow, fallback: string, prefix: string, 
 /** A fresh account snapshot plus an independently timestamped session counter. */
 export function usageCard(limits: AccountRateLimits | null, session?: TokenUsageSnapshot | null,
   unavailable?: string, now = Math.floor(Date.now() / 1000)): Delivery {
-  const buckets = new Map<string, RateLimitSnapshot>();
-  for (const [key, value] of Object.entries(limits?.rateLimitsByLimitId ?? {})) {
-    if (value) buckets.set(value.limitId || key, value);
-  }
-  const legacy = limits?.rateLimits;
-  if (legacy && !buckets.has(legacy.limitId || 'codex')) buckets.set(legacy.limitId || 'codex', legacy);
-  const all = [...buckets.entries()];
+  const all = Object.entries(limits?.rateLimitsByLimitId ?? {})
+    .filter((entry): entry is [string, RateLimitSnapshot] => !!entry[1]);
+  if (!all.length && limits?.rateLimits) all.push([limits.rateLimits.limitId ?? '', limits.rateLimits]);
   const windows = all.flatMap(([, bucket]) => [bucket.primary, bucket.secondary].filter((w): w is RateLimitWindow => !!w));
   const percentages = windows.map(remaining).filter((v): v is number => v !== null);
   const blocked = limits?.ordinaryUsageAllowed === false;
@@ -66,10 +62,10 @@ export function usageCard(limits: AccountRateLimits | null, session?: TokenUsage
   else if (reached) lines.push('**An account limit has been reached.**');
   if (unavailable) lines.push(unavailable);
   for (const [key, bucket] of all.slice(0, 4)) {
-    const prefix = all.length > 1 || key !== 'codex' ? `${label(bucket.limitName || key)} · ` : '';
+    const prefix = all.length > 1 || (key && key !== 'codex') ? `${label(bucket.limitName || key)} · ` : '';
     if (bucket.primary) lines.push(windowLines(bucket.primary, 'Primary', prefix, now));
     if (bucket.secondary) lines.push(windowLines(bucket.secondary, 'Secondary', prefix, now));
-    if (!bucket.primary && !bucket.secondary) lines.push(`**${label(bucket.limitName || key)}** · Allowance unavailable`);
+    if (!bucket.primary && !bucket.secondary) lines.push(`**${label(bucket.limitName || key || 'Account')}** · Allowance unavailable`);
   }
   if (!all.length && !unavailable) lines.push('Account allowance unavailable for this connection.');
   if (all.length > 4) lines.push(`-# ${all.length - 4} additional limit groups not shown.`);

@@ -23,7 +23,7 @@ Standard `node:` compatibility modules and `ws` are used where needed by the tra
 
 Discordex connects to the configured daemon socket and lists loaded Codex sessions. Automatic discovery periodically checks for eligible sessions within `projectRoots`; an empty list permits all projects. `/codex sessions` lists eligible sessions, and `/codex attach` links one explicitly. Scheduled sync requests coalesce while a sync is queued or running, so slow polls do not accumulate duplicate work ahead of incoming instructions. An individual sync still shares the serial queue with those instructions.
 
-Each top-level Codex conversation maps to one Discord thread under the configured text channel. Subagents join the parent's thread and retain their own labels. The mapping is stored in SQLite so reconnects can reuse the same Discord thread.
+Each linked top-level Codex conversation maps to one Discord thread under the configured text channel. Subagents join the parent's thread and retain their own labels. Discovery skips sessions the daemon marks ephemeral because linking requires persistent turn history. The mapping is stored in SQLite so reconnects can reuse the same Discord thread.
 
 If Discord confirms that a linked thread was deleted, Discordex creates a replacement and moves the parent session and its subagents to it. Deletion events, delivery failures, periodic history checks, and explicit attachment can trigger recovery, including deletions missed while the bridge was offline. Archived, unlocked threads are reopened when needed; permission failures and temporary network errors do not create replacements. Deleting the configured parent channel requires restoring or reconfiguring that channel.
 
@@ -31,13 +31,15 @@ Replacement preserves Codex sessions, goals, queued inputs, pending replies, cur
 
 The first attachment includes a currently active turn and future activity, without copying the whole old conversation. Tracked sessions are reattached on reconnect and their history is read from the last processed turn. This can keep those conversations loaded in the shared daemon while Discordex is running.
 
+Reverting Codex history can remove the turns Discordex uses as its checkpoint. If both saved boundaries are gone, Discordex picks up active turns, updates existing cards, and recognizes turns containing input from the linked Discord thread. It skips other completed turns because their IDs alone cannot establish whether they happened before or after the Discord thread was linked.
+
 The connection sees only its shared daemon. Sessions running with `--no-daemon` or on another daemon are not discovered.
 
 ## Messages and turns
 
 An allowed user's message in a linked thread is persisted in the inbox and submitted with the sender's identity. The Discord message ID becomes Codex's `clientUserMessageId`, which helps reconcile a submission if the connection fails around acceptance.
 
-Media preparation uses the initial message metadata immediately, outside the bridge queue. A bounded resource pool permits independent channels to prepare media concurrently; ordinary text bypasses the pool. Original files are saved before optional still previews, and durable source references reuse earlier originals across retries. Codex receives usable local paths plus any native image previews. Retention extends through consumption and active tool use. Preview failures and preview-capacity pressure do not discard usable originals. See [inbound media](file-sharing.md#media-sent-from-discord).
+Media preparation reads only the attachment collection on the incoming Discord message and runs outside the bridge queue. A bounded resource pool permits independent channels to prepare media concurrently; ordinary text bypasses the pool. Original files are saved before optional still previews, and durable source references reuse earlier originals across retries. Codex receives usable local paths plus any native image previews. Retention extends through consumption and active tool use. Preview failures and preview-capacity pressure do not discard usable originals. See [inbound media](file-sharing.md#media-sent-from-discord).
 
 Normal messages queue work. `/codex steer` adds instructions to the active turn, and `/codex stop` interrupts it. The index channel is not forwarded; bots and webhooks are ignored.
 
@@ -59,13 +61,13 @@ Footers show model and reasoning effort when available. The initial values are c
 
 `/codex model` reads the linked top-level thread's current settings and paginates `model/list` for its configured provider. A private Components V2 picker offers model and supported-effort dropdowns, with model pages of at most 25 options. The catalog supplies names, descriptions, defaults, and effort choices. Opening or changing the draft does not mutate the session or block the bridge's serial queue.
 
-Pickers are scoped to their contributor, thread, Discord channel, connection epoch, and control revision. Drafts live in a bounded in-memory map for 15 minutes. Apply is serialized with other bridge work, revalidates the live catalog and session settings, and calls `thread/settings/update` with only the thread ID, model, and supported effort. An unchanged selection avoids a write. The same session and Discord thread remain linked; active and historical turn cards retain their captured settings, while subsequent turns use the new values.
+Pickers are scoped to their contributor, thread, Discord channel, connection epoch, and control revision. Drafts live in a bounded in-memory map for 15 minutes. Apply is serialized with other bridge work, revalidates the live catalog and session settings, and calls `thread/settings/update` with only the thread ID, model, and supported effort. An unchanged selection avoids a write, including when the daemon leaves the current reasoning effort unspecified. The same session and Discord thread remain linked; active and historical turn cards retain their captured settings, while subsequent turns use the new values.
 
 Apply consumes the draft before writing, preventing duplicate clicks from resubmitting. A fresh thread read confirms success. Uncertain writes are never automatically replayed: reopening the command reads the daemon's current settings. Preflight comparisons reject changes observed from another client, but the protocol has no atomic compare-and-set guarantee across clients.
 
 ## Usage cards
 
-`/codex usage` reads `account/rateLimits/read` on demand and renders an ephemeral Components V2 card. Ten-segment emoji bars visualize the remaining allowance alongside its percentage: blue normally, yellow at 20% or below, and red at 10% or below, with dark empty segments. Window labels come from the reported duration. Multiple quota buckets are supported, with up to four groups shown to keep the card compact. Discord timestamps display reset times relative to the reader. Explicit backend blocking takes precedence over apparently available percentages, and elapsed reset times never imply a refilled allowance.
+`/codex usage` reads `account/rateLimits/read` on demand and renders an ephemeral Components V2 card. Ten-segment emoji bars visualize the remaining allowance alongside its percentage: blue normally, yellow at 20% or below, and red at 10% or below, with dark empty segments. Window labels come from the reported duration. The card shows up to four metered quota groups. When the daemon supplies no metered groups, it uses the legacy account snapshot. Discord timestamps display reset times relative to the reader. Explicit backend blocking takes precedence over apparently available percentages, and elapsed reset times never imply a refilled allowance.
 
 This read runs outside the bridge's serial work queue so a slow account service cannot delay approvals or turns. Account limits are fetched afresh and are not persisted. Unavailable limits, unsupported methods, and daemon disconnects produce a readable status rather than a guessed allowance.
 
@@ -76,6 +78,8 @@ For eligible linked sessions, `thread/tokenUsage/updated` notifications persist 
 Codex is authoritative for conversation history and pending requests. Discordex stores event-derived deliveries before sending them and uses stable keys to ignore repeated events. It uses Discord nonces to reduce duplicate sends around network failures.
 
 Discord's nonce deduplication window is finite. A crash after Discord accepted a message but before its ID was saved can still cause a duplicate after a sufficiently long outage. There is no exactly-once guarantee across the two services.
+
+The outbox records the revision it first attempted for each nonce. If a reply changes after that attempt and Discord returns a message ID on retry, Discordex saves the ID and edits that message to the current revision. Approval controls become available only after Discord confirms the required review attachment.
 
 Uncertain incoming submissions are reconciled against the daemon queue and history; they are not blindly replayed. Ordinary messages received while disconnected stay in the local inbox. The adapter recovers available missed Discord messages independently per channel. A channel remains gated until its buffered backlog has drained; a slow history read does not buffer unrelated channels. Concurrent catch-up callers share the actual recovery promise. Deleted or unavailable messages cannot be recovered.
 
@@ -125,7 +129,7 @@ Budget edits omit the objective and status to preserve usage accounting. Creatin
 | [`src/codex.ts`](../src/codex.ts) | Unix WebSocket transport, requests, notifications, heartbeat, and reconnects |
 | [`src/bridge.ts`](../src/bridge.ts) | Discovery, event handling, message routing, approvals, and recovery |
 | [`src/discord.ts`](../src/discord.ts) | Discord Gateway/REST, slash commands, buttons, modals, and message catch-up |
-| [`src/inbound-media.ts`](../src/inbound-media.ts) | Immediate media discovery, original downloads and optional still previews |
+| [`src/inbound-media.ts`](../src/inbound-media.ts) | Downloads of explicit Discord attachments and optional still previews |
 | [`src/inbound-cache.ts`](../src/inbound-cache.ts) | Immutable original files, retry references, retention and bounded resource slots |
 | [`src/turns.ts`](../src/turns.ts) | Durable per-agent turn state and model snapshots |
 | [`src/render.ts`](../src/render.ts) | Logical output and prompt rendering |

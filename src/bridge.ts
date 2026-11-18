@@ -153,7 +153,7 @@ export class Bridge {
       for (const threadId of page.data) {
         try {
           const { thread } = await this.codex.request<{ thread: Thread }>('thread/read', { threadId });
-          if (this.eligible(thread)) result.push(thread);
+          if (!thread.ephemeral && this.eligible(thread)) result.push(thread);
         } catch (error) { this.log(`Cannot inspect ${threadId}: ${error}`); }
       }
       cursor = page.nextCursor ?? null;
@@ -165,19 +165,19 @@ export class Bridge {
     ancestry.add(threadId);
     const { thread } = await this.codex.request<{ thread: Thread }>('thread/read', { threadId });
     if (!this.eligible(thread)) throw new Error('This project is outside the configured projectRoots');
+    if (thread.ephemeral) throw new Error('This Codex session is ephemeral. Linking requires a session with persistent turn history.');
     let binding = this.store.binding(threadId);
     if (binding && !binding.parentThreadId) {
       await this.recoverChannel(binding.channelId);
       binding = this.store.binding(threadId)!;
     }
     if (!binding) {
-      const page = await this.codex.request<{ data: Turn[] }>('thread/turns/list', { threadId, limit: 1, itemsView: 'notLoaded' });
+      const page = await this.codex.request<{ data: Turn[] }>('thread/turns/list', { threadId, limit: 1, itemsView: 'notLoaded', sortDirection: 'desc' });
       const active = page.data.find(t => t.status === 'inProgress');
       const parent = thread.parentThreadId ? await this.attach(thread.parentThreadId, ancestry) : undefined;
       const channelId = parent?.channelId ?? await this.chat.createThread(thread);
       binding = { threadId, channelId, parentThreadId: thread.parentThreadId ?? null,
         label: thread.agentNickname || thread.name || basename(thread.cwd) || 'Codex', cwd: thread.cwd,
-        since: Date.now() / 1000,
         initialTurnId: active?.id ?? null, checkpoint: page.data.find(t => t.status !== 'inProgress')?.id ?? null };
       this.store.saveBinding(binding);
       this.store.enqueue(`attached:${threadId}`, channelId, sessionCard(binding));
@@ -227,11 +227,8 @@ export class Bridge {
     }
     void this.flush();
   }
-  private withinBoundary(binding: Binding, turn: Turn): boolean {
-    return turn.id === binding.initialTurnId || (turn.completedAt ?? turn.startedAt ?? Infinity) >= binding.since;
-  }
   async reconcile(binding: Binding): Promise<void> {
-    const turns: Turn[] = [];
+    let turns: Turn[] = [];
     let cursor: string | null = null;
     let done = false;
     do {
@@ -239,21 +236,30 @@ export class Bridge {
         threadId: binding.threadId, cursor, limit: 50, itemsView: 'full', sortDirection: 'desc' });
       for (const turn of page.data) {
         if (turn.id === binding.checkpoint) { done = true; break; }
-        if (!this.withinBoundary(binding, turn)) { done = true; break; }
         turns.push(turn);
+        if (turn.id === binding.initialTurnId) { done = true; break; }
       }
       cursor = page.nextCursor ?? null;
     } while (cursor && !done);
+    const reanchored = !done && Boolean(binding.checkpoint || binding.initialTurnId);
+    if (reanchored) {
+      // thread/revert can remove both anchors while retaining pre-attachment history.
+      // Live turns, existing cards, and turns containing a known Discord input can be identified.
+      binding.checkpoint = turns.find(turn => turn.status !== 'inProgress')?.id ?? null;
+      binding.initialTurnId = turns.find(turn => turn.status === 'inProgress')?.id ?? null;
+      turns = turns.filter(turn => turn.status === 'inProgress' || this.store.turnState(binding.threadId, turn.id) ||
+        turn.items?.some(item => item.type === 'userMessage' && item.clientId && this.store.hasInput(item.clientId, binding.threadId)));
+    }
     for (const turn of turns.reverse()) {
       for (const item of turn.items ?? []) {
         this.store.saveItem(binding.threadId, item);
-        if (item.type === 'userMessage' && item.clientId) this.confirmInput(item.clientId, turn.id);
+        if (item.type === 'userMessage' && item.clientId) this.confirmInput(binding.threadId, item.clientId, turn.id);
       }
       this.refreshApprovals(binding);
       this.turns.reconcile(binding, turn);
       if (turn.status !== 'inProgress') {
         this.completeTurn(binding, turn);
-        binding.checkpoint = turn.id;
+        if (!reanchored) binding.checkpoint = turn.id;
       }
     }
     this.store.saveBinding(binding);
@@ -272,13 +278,15 @@ export class Bridge {
       if (approval) this.finishApproval(approval.token, 'resolved');
       return;
     }
-    if (packet.method === 'thread/started' && this.config.autoDiscover && this.eligible(p.thread)) {
+    if (packet.method === 'thread/started' && this.config.autoDiscover && !p.thread.ephemeral && this.eligible(p.thread)) {
       if (!this.store.binding(p.thread.id)) await this.attach(p.thread.id);
       return;
     }
     const binding = this.store.binding(p.threadId);
     if (!binding || !this.eligible({ ...binding, id: binding.threadId, status: { type: '' } })) return;
-    if (packet.method === 'thread/goal/updated' || packet.method === 'thread/goal/cleared') {
+    if (packet.method === 'thread/reverted') {
+      await this.reconcile(binding);
+    } else if (packet.method === 'thread/goal/updated' || packet.method === 'thread/goal/cleared') {
       // Read the authoritative snapshot: delayed notifications must not restore
       // a replaced goal or clear a newer one created in another client.
       if (!binding.parentThreadId) await this.goals.read(binding);
@@ -288,7 +296,7 @@ export class Bridge {
     } else if (packet.method === 'item/started' || packet.method === 'item/completed') {
       this.store.saveItem(binding.threadId, p.item);
       this.refreshApprovals(binding);
-      if (p.item.type === 'userMessage' && p.item.clientId) this.confirmInput(p.item.clientId, p.turnId);
+      if (p.item.type === 'userMessage' && p.item.clientId) this.confirmInput(binding.threadId, p.item.clientId, p.turnId);
       this.turns.item(binding, p.turnId, p.item, packet.method === 'item/completed');
     } else if (packet.method === 'turn/completed') {
       // Terminal evidence takes effect immediately, even when optional history hydration fails.
@@ -386,10 +394,11 @@ export class Bridge {
     const input = this.store.input(id)!;
     return input.state === 'unknown' ? 'Submission outcome is uncertain. Check the session before resending.' : input.state === 'new' ? 'Saved locally; waiting for Codex to become available' : 'Queued for Codex';
   }
-  private confirmInput(id: string, turnId?: string): void {
+  private confirmInput(threadId: string, id: string, turnId: string): void {
+    if (!this.store.hasInput(id, threadId)) return;
     this.store.db.transaction(() => {
       this.store.inputState(id, 'delivered');
-      if (turnId) this.store.bindInputMediaTurn(id, turnId);
+      this.store.bindInputMediaTurn(id, turnId);
       this.store.revise(`uncertain:${id}`, message(`Delivery confirmed for Discord message ${id}. No need to resend it.`));
     })();
   }
@@ -435,13 +444,13 @@ export class Bridge {
       const first = this.store.pendingInputs(binding.threadId).find(i => i.state === 'queued' && remaining.some(q => q.id === i.queueId));
       if (first) {
         try {
-          const response = await this.codex.request<{ turn?: { id: string } }>('thread/queue/start', { threadId: binding.threadId, queuedSubmissionId: first.queueId });
-          this.confirmInput(first.id, response.turn?.id);
+          const response = await this.codex.request<{ turn: { id: string } }>('thread/queue/start', { threadId: binding.threadId, queuedSubmissionId: first.queueId });
+          this.confirmInput(binding.threadId, first.id, response.turn.id);
         }
         catch (error) {
           // Another client may still win between the fresh snapshots and this RPC.
-          if (error instanceof RpcError && error.message.startsWith('queued submission not found:')) await this.reconcile(binding);
-          else this.log(`Queue start ${first.id}: ${error}`);
+          if (this.codex.connected) await this.reconcile(binding);
+          if (this.store.input(first.id)?.state !== 'delivered') this.log(`Queue start ${first.id}: ${error}`);
         }
       }
     }
@@ -449,7 +458,7 @@ export class Bridge {
   async control(channelId: string, action: 'steer' | 'stop', text?: string, userId?: string, name?: string, interactionId?: string): Promise<void> {
     if (!userId || !this.config.allowedUserIds.includes(userId)) throw new Error('You are not configured to control Codex');
     const binding = this.requireBinding(channelId);
-    const page = await this.codex.request<{ data: Turn[] }>('thread/turns/list', { threadId: binding.threadId, limit: 1, itemsView: 'notLoaded' });
+    const page = await this.codex.request<{ data: Turn[] }>('thread/turns/list', { threadId: binding.threadId, limit: 1, itemsView: 'notLoaded', sortDirection: 'desc' });
     const turn = page.data.find(t => t.status === 'inProgress');
     if (!turn) throw new Error('This session has no active turn');
     if (action === 'stop') await this.codex.request('turn/interrupt', { threadId: binding.threadId, turnId: turn.id });
@@ -491,7 +500,13 @@ export class Bridge {
         }
         else {
           const nonce = deliveryNonce(row.generation ? `${row.key}:${row.channel}:${row.generation}` : row.key);
-          const sent = await this.chat.send(row.channel, delivery, nonce);
+          const firstSendRevision = this.store.beginSend(row);
+          if (firstSendRevision === undefined) continue;
+          const sent = await this.chat.send(row.channel, delivery, nonce, firstSendRevision !== row.revision);
+          if (typeof sent !== 'string' && sent.needsEdit) {
+            this.store.rememberMessage(row, sent.id);
+            continue;
+          }
           this.store.delivered(row, typeof sent === 'string' ? sent : sent.id,
             typeof sent === 'string' ? delivery.approvalReview : sent.approvalReview ?? delivery.approvalReview,
             typeof sent === 'string' ? false : sent.retryAttachments);

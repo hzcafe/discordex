@@ -179,7 +179,7 @@ Yes. Discordex attaches to the shared daemon alongside your local client. It dis
 
 ### What can I send as an attachment?
 
-Send PNG, JPEG, WebP, GIF, AVIF, MP4, MOV, or WebM files in a linked thread. Discordex saves supported originals on the host so Codex can inspect them with tools. Images can also supply a still preview, including the first frame of an animated GIF. For video, the preview uses a thumbnail when the Discord embed supplies one. For voice messages and other unsupported attachments, Codex receives a link and a format notice.
+Send PNG, JPEG, WebP, GIF, AVIF, MP4, MOV, or WebM files in a linked thread. Discordex saves supported originals on the host so Codex can inspect them with tools. Images can also supply a still preview, including the first frame of an animated GIF. Videos supply the original file for frame extraction. Pasted media URLs and GIF-picker links reach Codex as text. For voice messages and other unsupported attachments, Codex receives a link and a format notice.
 
 In the other direction, a final reply can share a referenced image or video inline, or attach a document such as a PDF. By default, Discordex looks for those files in the session's working directory. See [sharing roots, supported formats, and limits](docs/file-sharing.md).
 

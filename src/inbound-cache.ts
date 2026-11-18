@@ -141,10 +141,16 @@ export class InboundMediaCache {
       path: join(this.directory, `${row.hash}.${row.extension}`), retainedUntil: row.retainedAt + this.limits.retentionDays * 86_400_000 };
   }
 
-  lookup(inputId: string, sourceKey: string): Promise<{ saved: SavedMedia; bytes: Buffer } | undefined> {
+  lookup(inputId: string, sourceKey: string, legacyKey?: string): Promise<{ saved: SavedMedia; bytes: Buffer } | undefined> {
     return this.serial(async () => {
-      const row = this.store.db.query<CachedRow, [string, string]>(`SELECT m.* FROM inbound_media_refs r
-        JOIN inbound_media m ON m.hash = r.hash WHERE r.inputId = ? AND r.sourceKey = ?`).get(inputId, sourceKey);
+      const find = this.store.db.query<CachedRow, [string, string]>(`SELECT m.* FROM inbound_media_refs r
+        JOIN inbound_media m ON m.hash = r.hash WHERE r.inputId = ? AND r.sourceKey = ?`);
+      let row = find.get(inputId, sourceKey);
+      if (!row && legacyKey) {
+        row = find.get(inputId, legacyKey);
+        if (row) this.store.db.query('UPDATE inbound_media_refs SET sourceKey = ? WHERE inputId = ? AND sourceKey = ?')
+          .run(sourceKey, inputId, legacyKey);
+      }
       if (!row) return;
       const bytes = await this.verifiedBytes(row);
       if (!bytes) return;

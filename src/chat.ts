@@ -4,11 +4,17 @@ export function discordNotFound(error: unknown, code: number): boolean {
     && 'status' in error && error.status === 404;
 }
 
-/** Payload rejections require a changed message; network/access failures remain retryable. */
-export function invalidDelivery(error: unknown): boolean {
+/** Discord reports generic invalid forms for both JSON and multipart requests. */
+export function uploadRejected(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (
     ('status' in error && error.status === 413)
-    || ('code' in error && [50006, 50035, 40005, 50045, 50146].includes(Number(error.code))));
+    || ('code' in error && [40005, 50045, 50046, 50146].includes(Number(error.code))));
+}
+
+/** Payload rejections require a changed message; network/access failures remain retryable. */
+export function invalidDelivery(error: unknown): boolean {
+  return uploadRejected(error) || (typeof error === 'object' && error !== null
+    && 'code' in error && [50006, 50035].includes(Number(error.code)));
 }
 
 /** Known temporary upload failures can deliver text now and retry files separately. */

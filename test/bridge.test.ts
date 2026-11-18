@@ -82,6 +82,22 @@ function approval(id: string | number = 9): Packet {
   return { id, method: 'item/commandExecution/requestApproval', params: { threadId: 't1', turnId: 'turn1', itemId: 'command1', command: 'git status', availableDecisions: ['accept', 'decline'] } };
 }
 
+test('discovery skips ephemeral sessions before requesting history or creating a Discord thread', async () => {
+  const store = new Store(':memory:');
+  const codex = new FakeCodex(); const chat = new FakeChat();
+  const bridge = new Bridge({ ...config, autoDiscover: true }, codex, store, chat);
+  try {
+    codex.thread.ephemeral = true;
+    expect(await bridge.sessions()).toEqual([]);
+    await bridge.notification({ method: 'thread/started', params: { thread: codex.thread } });
+    await expect(bridge.attach(codex.thread.id)).rejects.toThrow('ephemeral');
+    expect(codex.calls.map(call => call.method)).toEqual(['thread/loaded/list', 'thread/read', 'thread/read']);
+    expect(chat.created).toHaveLength(0);
+    codex.thread.ephemeral = false;
+    expect((await bridge.sessions()).map(thread => thread.id)).toEqual([codex.thread.id]);
+  } finally { await bridge.stop(); store.close(); }
+});
+
 test.each(['command', 'diff'])('late %s details repair the same pending prompt and enable it only after delivery', async kind => {
   const { bridge, codex, store } = fixture();
   const packet: Packet = kind === 'command' ? approval() : { id: 7, method: 'item/fileChange/requestApproval',
@@ -491,12 +507,49 @@ test('history before first attachment is not exported, but an already-active tur
   const { bridge, codex, chat, store } = fixture();
   store.saveBinding({ ...binding, since: 100, initialTurnId: 'active' });
   codex.turns = [
-    { id: 'old', status: 'completed', completedAt: 50, items: [{ id: 'a', type: 'agentMessage', text: 'old' }] },
+    { id: 'old', status: 'completed', completedAt: null, items: [{ id: 'a', type: 'agentMessage', text: 'old' }] },
     { id: 'active', status: 'completed', completedAt: 90, items: [{ id: 'b', type: 'agentMessage', text: 'current' }] },
   ];
   await bridge.sync(); await bridge.flush();
   expect(chat.sent).toHaveLength(1);
   expect(chat.sent[0]!.delivery.content).toContain('current');
+});
+
+test('a revert past the attachment boundary keeps retained history private and preserves the active turn', async () => {
+  const { bridge, codex, chat, store } = fixture();
+  store.saveBinding({ ...binding, initialTurnId: 'removed-first', checkpoint: 'removed-latest' });
+  codex.turns = [
+    { id: 'retained', status: 'completed', items: [{ id: 'old', type: 'agentMessage', text: 'Before attachment' }] },
+    { id: 'active', status: 'inProgress', items: [{ id: 'new', type: 'agentMessage', text: 'Current work', phase: 'commentary' }] },
+  ];
+  await bridge.notification({ method: 'thread/reverted', params: { threadId: 't1' } });
+  await bridge.flush();
+  expect(store.binding('t1')).toMatchObject({ checkpoint: 'retained', initialTurnId: 'active' });
+  expect(store.turnState('t1', 'retained')).toBeUndefined();
+  expect(store.turnState('t1', 'active')).toBeDefined();
+  codex.turns[1] = { id: 'active', status: 'completed', items: [{ id: 'final', type: 'agentMessage', text: 'Finished' }] };
+  await bridge.sync(); await bridge.flush();
+  expect(store.binding('t1')!.checkpoint).toBe('active');
+  expect(chat.sent).toHaveLength(1);
+  store.db.query('UPDATE outbox SET nextAttempt = 0').run();
+  await bridge.flush();
+  expect(chat.edits.at(-1)?.delivery.content ?? chat.sent[0]?.delivery.content).toBe('Finished');
+});
+
+test('a reverted history still confirms a completed turn containing an input from this Discord thread', async () => {
+  const { bridge, codex, store } = fixture();
+  store.saveBinding({ ...binding, initialTurnId: null, checkpoint: 'removed' });
+  store.addInput('msg', binding.threadId, 'Finish the report');
+  store.addInput('other-msg', 'another-thread', 'Unrelated work');
+  codex.turns = [
+    { id: 'old', status: 'completed', items: [{ id: 'x', type: 'userMessage', clientId: 'other-msg' }] },
+    { id: 'completed-offline', status: 'completed', items: [{ id: 'y', type: 'userMessage', clientId: 'msg' }] },
+  ];
+  await bridge.reconcile(store.binding(binding.threadId)!);
+  expect(store.input('msg')!.state).toBe('delivered');
+  expect(store.input('other-msg')!.state).toBe('new');
+  expect(store.turnState(binding.threadId, 'old')).toBeUndefined();
+  expect(store.turnState(binding.threadId, 'completed-offline')).toBeDefined();
 });
 
 test('an inbox containing only delivered inputs requires no thread or queue reads to drain', async () => {
@@ -597,7 +650,7 @@ test('another client winning the final queue/start race is reconciled without an
     if (method === 'thread/queue/start') {
       codex.queue = []; codex.thread.status = { type: 'active' };
       codex.turns = [{ id: 'turn1', status: 'inProgress', items: [{ id: 'u1', type: 'userMessage', clientId: 'm1' }] }];
-      throw new RpcError(-32600, 'queued submission not found: q0');
+      throw new RpcError(-32600, 'another client has already started this entry');
     }
     return request(method, params);
   };
@@ -643,6 +696,27 @@ test('one approval decision is sent, only offered decisions are accepted, and lo
   await bridge.flush();
   expect(chat.edits.find(e => e.delivery.buttons)?.delivery.buttons).toEqual([]);
   expect(store.approval(a.token)!.state).toBe('resolved');
+});
+
+test('a subcommand callback without its own command cannot borrow the parent command for approval', async () => {
+  const { bridge, store } = fixture();
+  store.saveItem('t1', { id: 'command1', type: 'commandExecution', command: 'parent-command' });
+  const packet = approval();
+  delete packet.params!.command;
+  packet.params!.approvalId = 'child-callback';
+  await bridge.serverRequest(packet);
+  const prompt = store.pendingApprovals()[0]!;
+  expect(approvalDelivery(prompt).buttons).toEqual([]);
+  expect(JSON.parse(prompt.packet).params.command).toBeUndefined();
+});
+
+test('a client message ID observed on another thread cannot confirm local delivery', async () => {
+  const { bridge, store } = fixture();
+  store.addInput('m1', 't2', 'hello');
+  await bridge.notification({ method: 'item/completed', params: {
+    threadId: 't1', turnId: 'turn1', item: { id: 'u1', type: 'userMessage', clientId: 'm1' },
+  } });
+  expect(store.input('m1')!.state).toBe('new');
 });
 
 test('authorized approvers can decide requests containing machine paths from Discord', async () => {

@@ -1,7 +1,6 @@
 import { expect, spyOn, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
 import { Embed, EmbedType, Events, Message } from 'discord.js';
-import type { APIEmbed } from 'discord.js';
 import sharp from 'sharp';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -11,9 +10,6 @@ import { DiscordAdapter } from '../src/discord.js';
 import { InputCapacityError, Store } from '../src/store.js';
 import type { Config } from '../src/config.js';
 import type { CodexPort } from '../src/types.js';
-
-// discord.js marks this constructor private in types; use the actual runtime class for wire fixtures.
-const libraryEmbed = (data: APIEmbed): Embed => Reflect.construct(Embed, [data]);
 
 const mockDownload = (handler: (...args: Parameters<typeof fetch>) => Promise<Response>) => spyOn(globalThis, 'fetch').mockImplementation(Object.assign(handler, { preconnect: fetch.preconnect }));
 
@@ -37,7 +33,6 @@ function fixture(connected = false) {
   const receive = (value = msg) => (adapter as any).receive(value) as Promise<void>;
   return { store, adapter, bridge, codex, msg, replies, reactions, receive, close: async () => { await adapter.close(); await bridge.stop(); store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
-const mp4Bytes = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
 const imageBytes = () => sharp({ create: { width: 10, height: 10, channels: 3, background: '#ff0000' } }).png().toBuffer();
 
 test('image-only messages preserve ordering, deduplicate downloads, and never hold the approval queue', async () => {
@@ -80,14 +75,17 @@ test('temporary media failure keeps the history cursor retryable and repairs one
   } finally { await f.close(); download.mockRestore(); }
 });
 
-test('a real discord.js Message forwards an existing GIF embed to the native Codex queue', async () => {
+test.each([false, true])('a real message with links and a GIF embed processes only its explicit upload (present = %s)', async withUpload => {
   const f = fixture(true); const bytes = await imageBytes();
   const link = 'https://klipy.com/gifs/firefly-hsr-10';
   const proxy = 'https://images-ext-1.discordapp.net/external/hash/https/static.klipy.com/preview.webp';
+  const uploadedURL = 'https://cdn.discordapp.com/attachments/c/i/uploaded.png';
+  const pastedURL = 'https://cdn.discordapp.com/attachments/c/i/pasted.gif';
+  const content = `${link} ${pastedURL} <:emoji:123>`;
   const msg = Reflect.construct(Message, [f.adapter.client, {
-    id: '101', channel_id: '100', guild_id: 'guild', type: 0, content: link,
+    id: '101', channel_id: '100', guild_id: 'guild', type: 0, content,
     author: { id: 'alice', username: 'Alice', discriminator: '0', avatar: null, bot: false },
-    timestamp: '2026-11-17T19:36:38.258000+00:00', mentions: [], attachments: [],
+    timestamp: '2026-11-17T19:36:38.258000+00:00', mentions: [], attachments: withUpload ? [{ id: '123', filename: 'uploaded.png', url: uploadedURL, proxy_url: uploadedURL, size: bytes.length, content_type: 'image/png' }] : [],
     embeds: [{ type: EmbedType.GIFV, url: link, title: 'Firefly HSR Happy Birthday Greeting',
       provider: { name: 'Klipy', url: 'https://klipy.com' },
       thumbnail: { url: 'https://static.klipy.com/preview.webp', proxy_url: proxy, width: 320, height: 220 },
@@ -96,23 +94,30 @@ test('a real discord.js Message forwards an existing GIF embed to the native Cod
   msg.react = async () => ({} as any);
   const submissions: any[] = [];
   f.codex.request = (async (method: string, params: any) => {
-    if (method === 'thread/read') return { thread: { id: 't1', cwd: '/work', status: { type: 'active' } } };
+    if (method === 'thread/read') return { thread: { id: 't1', cwd: '/work', canAcceptDirectInput: true, status: { type: 'active' } } };
     if (method === 'thread/queue/list') return { data: submissions.map(p => ({ id: 'q1', clientUserMessageId: p.clientUserMessageId })) };
     if (method === 'thread/queue/add') { submissions.push(params); return { queuedSubmission: { id: 'q1' } }; }
     throw new Error(`Unexpected method ${method}`);
   }) as CodexPort['request'];
-  const download = mockDownload(async url => new Response(new Uint8Array(String(url).endsWith('.mp4') ? mp4Bytes : bytes)));
+  const download = mockDownload(async () => new Response(new Uint8Array(bytes)));
   try {
     expect(msg.embeds[0]).toBeInstanceOf(Embed);
     expect(msg.embeds[0]!.data.type).toBe(EmbedType.GIFV);
     await Promise.all([(f.adapter as any).receive(msg), (f.adapter as any).receive(msg)]);
-    expect(download).toHaveBeenCalledTimes(2); expect(download.mock.calls[1]![0]).toBe(proxy);
+    expect(download.mock.calls.map(([url]) => url)).toEqual(withUpload ? [uploadedURL] : []);
     expect(submissions).toHaveLength(1);
+    const input = submissions[0].input;
     expect(submissions[0].clientUserMessageId).toBe('101');
-    expect(submissions[0].input[0].text).toContain('still preview only');
-    expect(submissions[0].input[0].text).toContain('https://static.klipy.com/clip.mp4');
-    expect(submissions[0].input[1].type).toBe('image');
-    expect(submissions[0].input[1].url).toStartWith('data:image/png;base64,');
+    expect(input).toHaveLength(withUpload ? 2 : 1);
+    expect(input[0].text).toContain(content);
+    expect(input[0].text).not.toContain('https://static.klipy.com/clip.mp4');
+    if (withUpload) {
+      expect(input[0].text).toContain('Original "uploaded.png"');
+      expect(input[1].url).toStartWith('data:image/png;base64,');
+    } else {
+      expect(input[0].text).toBe(`[Discord: Alice; user ID: alice]\n${content}`);
+      expect(f.store.db.query('SELECT count(*) AS n FROM inbound_media_refs').get()).toEqual({ n: 0 });
+    }
   } finally { await f.close(); download.mockRestore(); }
 });
 
@@ -129,22 +134,18 @@ test('a provider link without media metadata forwards immediately without sleepi
   } finally { sleep.mockRestore(); await f.close(); download.mockRestore(); }
 });
 
-test('a direct GIF uses the immediate signed original instead of a converted proxy or a message refresh', async () => {
-  const f = fixture(); const bytes = await sharp(await imageBytes()).gif().toBuffer();
-  const bare = 'https://cdn.discordapp.com/attachments/channel/id/animation.gif';
-  const signed = `${bare}?ex=123&hm=renewed`;
-  const proxy = signed.replace('cdn.discordapp.com', 'media.discordapp.net');
-  f.msg.content = bare; f.msg.attachments.clear();
-  f.msg.embeds = [libraryEmbed({ type: EmbedType.Image, url: bare, thumbnail: { url: signed, proxy_url: proxy } })];
-  (f.msg as any).fetch = async () => { throw new Error('Must not refresh'); };
-  const download = mockDownload(async () => new Response(new Uint8Array(bytes)));
+test('an embed without message text or attachments never becomes a Codex input', async () => {
+  const f = fixture();
+  f.msg.attachments.clear();
+  f.msg.embeds.push(Reflect.construct(Embed, [{
+    type: EmbedType.Image, image: { url: 'https://cdn.discordapp.com/attachments/c/i/photo.png' },
+  }]));
+  const download = mockDownload(async () => { throw new Error('An embed must not be downloaded'); });
   try {
-    await Promise.all([f.receive(), f.receive()]);
-    expect(download).toHaveBeenCalledTimes(1); expect(download.mock.calls[0]![0]).toBe(signed);
-    const input = f.store.inputs()[0]!;
-    expect(input.text).toContain(`Source: ${signed}`); expect(input.text).toContain('image/gif');
-    expect(input.text).toContain('first frame only'); expect(JSON.parse(input.images)).toHaveLength(1);
-    await f.receive(); expect(f.store.inputs()).toHaveLength(1);
+    await f.receive();
+    expect(download).not.toHaveBeenCalled();
+    expect(f.store.inputs()).toHaveLength(0);
+    expect(f.replies[0].content).toBe('This message has no text or file attachment to forward.');
   } finally { await f.close(); download.mockRestore(); }
 });
 

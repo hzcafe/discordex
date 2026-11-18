@@ -87,3 +87,19 @@ test('session tokens are independently timestamped and do not claim to be remain
   }
   expect(tokenUsageSnapshot({ total: { totalTokens: 0, inputTokens: 0, outputTokens: 0 } }, now)?.total.totalTokens).toBe(0);
 });
+
+test('metered map keys identify buckets and a legacy fallback cannot add a phantom limit', () => {
+  const data: AccountRateLimits = {
+    rateLimitsByLimitId: {
+      review: { limitId: null, primary: window(20) },
+      images: { limitId: null, primary: window(40) },
+    },
+    rateLimits: { limitId: null, primary: window(100), spendControlReached: true },
+  };
+  const delivery = usageCard(data);
+  expect(delivery.content).toContain('review · Weekly allowance · 80% left');
+  expect(delivery.content).toContain('images · Weekly allowance · 60% left');
+  expect(delivery.content).not.toContain('An account limit has been reached');
+  expect(delivery.card?.tone).toBe('info');
+  expect(usageCard({ ...data, rateLimitsByLimitId: null }).card?.tone).toBe('danger');
+});

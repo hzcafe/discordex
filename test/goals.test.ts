@@ -109,6 +109,28 @@ test('another contributor can operate goals, but unauthorized users, channels, a
   expect(f.codex.calls).toHaveLength(0);
 });
 
+test('goal action receipts report the persisted status and an already-cleared goal', async () => {
+  const f = fixture();
+  f.codex.goal = sample({ status: 'paused' });
+  await f.bridge.showGoal('channel', 'alice');
+  const request = f.codex.request.bind(f.codex);
+  f.codex.request = async <T>(method: string, params?: any): Promise<T> => {
+    if (method === 'thread/goal/set') {
+      f.codex.goal = sample({ status: 'usageLimited' });
+      return { goal: f.codex.goal } as T;
+    }
+    if (method === 'thread/goal/clear') {
+      f.codex.goal = null;
+      return { cleared: false } as T;
+    }
+    return request<T>(method, params);
+  };
+  expect(await f.action('resume')).toContain('Usage limited');
+  expect(f.store.goalCard('root')!.goal?.status).toBe('usageLimited');
+  expect(await f.action('clear')).toBe('There was no goal to clear.');
+  expect(f.store.goalCard('root')!.goal).toBeNull();
+});
+
 test('stale buttons and submitted modals cannot overwrite a replaced or edited goal', async () => {
   const f = fixture(); f.codex.goal = sample(); await f.bridge.showGoal('channel', 'alice');
   const old = f.version();

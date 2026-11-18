@@ -12,15 +12,13 @@ import { deliveryFiles, discordPayload, discordEditPayload, prepareDiscordPayloa
 import { parseGoalControl } from './goals.js';
 import { modelPickerPayload, parseModelControl } from './models.js';
 import { InputCapacityError, Store } from './store.js';
-import { hasIncomingMedia, type IncomingMedia, MediaRetryError, prepareIncomingMedia } from './inbound-media.js';
+import { type IncomingMedia, MediaRetryError, prepareIncomingMedia } from './inbound-media.js';
 import { InboundMediaCache } from './inbound-cache.js';
-import { discordNotFound, MissingMessageError, MissingThreadError, temporaryUploadFailure } from './chat.js';
+import { discordNotFound, MissingMessageError, MissingThreadError, temporaryUploadFailure, uploadRejected } from './chat.js';
 import { artifactUploads } from './artifacts.js';
 import { rejectedReviewNotice, retryingReviewNotice, withoutGeneratedFile } from './uploads.js';
 import type { ChatPort, Delivery, DeliveryReceipt, Packet, Thread, UploadedFile, UploadFile } from './types.js';
 
-const uploadRejected = (error: unknown) => typeof error === 'object' && error !== null &&
-  (('status' in error && error.status === 413) || ('code' in error && [40005, 50035, 50045, 50146].includes(Number(error.code))));
 const withoutFiles = (delivery: Delivery, retrying: boolean): Delivery => ({ ...withoutGeneratedFile(delivery), artifacts: undefined,
   artifactNotes: [...delivery.artifactNotes ?? [], ...(delivery.file?.requiredForActions
     ? [retrying ? retryingReviewNotice : rejectedReviewNotice]
@@ -31,16 +29,15 @@ const withoutFiles = (delivery: Delivery, retrying: boolean): Delivery => ({ ...
 /** V2 file/gallery uploads may be present only in components, with an empty attachments collection. */
 function messageFiles(message: Message): { id: string; name: string }[] {
   const files = [...message.attachments?.values() ?? []].map(a => ({ id: a.id, name: a.name }));
-  const media = (item: APIUnfurledMediaItem) => {
-    if (!item.attachment_id) return;
-    try {
-      const name = decodeURIComponent(new URL(item.url).pathname.split('/').at(-1)!);
-      if (name) files.push({ id: item.attachment_id, name });
-    } catch { /* An unusable URL cannot identify an uploaded filename. */ }
+  const media = (item: APIUnfurledMediaItem, name?: string | null) => {
+    if (item.attachment_id && name && !files.some(file => file.id === item.attachment_id)) {
+      files.push({ id: item.attachment_id, name });
+    }
   };
   const visit = (component: APIMessageComponent) => {
-    if (component.type === ComponentType.File) media(component.file);
-    else if (component.type === ComponentType.MediaGallery) component.items.forEach(item => media(item.media));
+    if (component.type === ComponentType.File) media(component.file, component.name);
+    // Our outgoing gallery sets its item description to the upload filename.
+    else if (component.type === ComponentType.MediaGallery) component.items.forEach(item => media(item.media, item.description));
     if ('components' in component) component.components.forEach(visit);
   };
   for (const component of message.components ?? []) visit(component.toJSON());
@@ -188,7 +185,7 @@ export class DiscordAdapter implements ChatPort {
     this.store.revise(`input-media-retry:${id}`, card('The message is saved for Codex. Any unavailable media is identified in the forwarded message.', { title: 'Message received' }));
   }
   private async receiveInput(msg: Message): Promise<void> {
-    if (!msg.content.trim() && !msg.attachments?.size && !msg.embeds?.length) {
+    if (!msg.content.trim() && !msg.attachments?.size) {
       // Unlike text submissions, warnings have no input row to deduplicate them.
       // Share in-flight replies and persist success without moving the history cursor.
       const key = `non-text-reply:${msg.id}`;
@@ -196,7 +193,7 @@ export class DiscordAdapter implements ChatPort {
       let pending = this.nonTextReplies.get(msg.id);
       if (!pending) {
         pending = Promise.resolve().then(async () => {
-          await msg.reply({ content: 'This message has no text or supported image attachment to forward.',
+          await msg.reply({ content: 'This message has no text or file attachment to forward.',
             nonce: deliveryNonce(key), enforceNonce: true, allowedMentions: { parse: [], repliedUser: false } });
           this.store.setMeta(key, 'sent');
         }).finally(() => { this.nonTextReplies.delete(msg.id); });
@@ -208,22 +205,23 @@ export class DiscordAdapter implements ChatPort {
     try {
       // Media work is bounded and runs outside the bridge queue, so downloads do
       // not hold up approval decisions or Codex events.
-      const media: IncomingMedia = hasIncomingMedia(msg)
-        ? await this.media.run(() => prepareIncomingMedia(msg, fetch, { cache: this.media, inputId: msg.id }))
-        : { images: [], notes: [], warnings: [] };
-      const text = () => [msg.content, ...(media.notes.length ? [`[Discord media]\n${media.notes.join('\n')}`] : [])].filter(Boolean).join('\n\n');
-      if (!text().trim() && !media.images.length) return;
+      const media: IncomingMedia = msg.attachments?.size
+        ? await this.media.run(() => prepareIncomingMedia(msg.attachments, fetch, { cache: this.media, inputId: msg.id }))
+        : { previews: [], notes: [], warnings: [] };
+      if (!msg.content.trim() && !media.notes.length && !media.previews.length) return;
       const result = await this.bridge!.serial(async () => {
-        const submit = () => this.bridge!.submit(msg.channelId, msg.id, msg.author.id,
-          msg.member?.displayName ?? msg.author.username, text(), media.images);
-        try { return await submit(); }
+        const submit = (previews: IncomingMedia['previews']) => {
+          const notes = [...media.notes, ...previews.map(preview => preview.caption)];
+          const text = [msg.content, ...(notes.length ? [`[Discord media]\n${notes.join('\n')}`] : [])].filter(Boolean).join('\n\n');
+          return this.bridge!.submit(msg.channelId, msg.id, msg.author.id,
+            msg.member?.displayName ?? msg.author.username, text, previews.map(preview => preview.image));
+        };
+        try { return await submit(media.previews); }
         catch (error) {
-          if (!(error instanceof InputCapacityError) || !media.originals?.length) throw error;
-          media.images = [];
-          media.notes = media.notes.filter(note => !/^Image \d+:/.test(note));
+          if (!(error instanceof InputCapacityError) || !media.previews.length || !media.originals?.length) throw error;
           const warning = 'Image preview storage is full; the saved original files are available for analysis.';
           media.notes.push(warning); media.warnings.push(warning);
-          return await submit();
+          return await submit([]);
         }
       });
       this.mediaReceived(msg.id);
@@ -412,7 +410,7 @@ export class DiscordAdapter implements ChatPort {
       } catch (error) {
         if (!discordNotFound(error, 10008) && !(error instanceof MissingThreadError && error.channelId === id)) throw error;
         // A new nonce is needed even if the saved starter was deleted immediately.
-        this.store.setMeta(`${base}:generation`, `${base}:${crypto.randomUUID()}`);
+        this.store.setMeta(`${base}:generation`, `${base}:after:${id}`);
         if (attempt >= 1) throw error;
       }
     }
@@ -429,16 +427,22 @@ export class DiscordAdapter implements ChatPort {
     if (activate && channel.archived && !channel.locked) await channel.setArchived(false);
     return channel;
   }
-  private rememberFiles(channelId: string, message: Message, delivery: Delivery, files: UploadFile[]): void {
+  private fileReceipt(channelId: string, message: Message, delivery: Delivery, files: UploadFile[],
+    approvalReview: Delivery['approvalReview'], retryAttachments: boolean): DeliveryReceipt {
     const uploaded: UploadedFile[] = [];
     const available = messageFiles(message);
-    for (const file of deliveryFiles(delivery, files, this.config.artifacts)) {
+    const expected = deliveryFiles(delivery, files, this.config.artifacts);
+    for (const file of expected) {
       const attachment = available.find(a => a.name === file.name);
       if (attachment) uploaded.push({ name: file.name, hash: file.hash, id: attachment.id });
     }
+    if (uploaded.length !== expected.length || uploaded.length !== available.length) {
+      return { retryAttachments: true, approvalReview: approvalReview && { ...approvalReview, state: 'unavailable' } };
+    }
     this.store.setMeta(`attachments:${channelId}:${message.id}`, JSON.stringify(uploaded));
+    return { approvalReview, ...(retryAttachments ? { retryAttachments: true } : {}) };
   }
-  async send(channelId: string, delivery: Delivery, nonce: string): Promise<string | (DeliveryReceipt & { id: string })> {
+  async send(channelId: string, delivery: Delivery, nonce: string, revisedWithoutReceipt = false): Promise<string | (DeliveryReceipt & { id: string; needsEdit?: true })> {
     try {
       const channel = await this.channel(channelId);
       let prepared = artifactUploads(this.store, delivery);
@@ -448,15 +452,22 @@ export class DiscordAdapter implements ChatPort {
       try { sent = await channel.send({ ...plan.payload, nonce, enforceNonce: true }); }
       catch (error) {
         retryAttachments = temporaryUploadFailure(error);
-        if ((!uploadRejected(error) && !retryAttachments) || !deliveryFiles(prepared.delivery, prepared.files, this.config.artifacts).length) throw error;
+        if ((!uploadRejected(error) && !retryAttachments) || !plan.payload.files.length) throw error;
         console.error(`Discord file upload rejected: ${compact(String(error), 1000)}`);
         prepared = { delivery: withoutFiles(prepared.delivery, retryAttachments), files: [] };
         plan = prepareDiscordPayload(prepared.delivery, [], [], this.config.artifacts);
         sent = await channel.send({ ...plan.payload, nonce, enforceNonce: true });
       }
-      this.rememberFiles(channelId, sent, prepared.delivery, prepared.files);
-      return plan.approvalReview || retryAttachments ? { id: sent.id, approvalReview: plan.approvalReview,
-        ...(retryAttachments ? { retryAttachments: true } : {}) } : sent.id;
+      // Discord can return an older revision for this nonce, even with identical
+      // filenames. Only a successful edit establishes which bytes it now holds.
+      if (revisedWithoutReceipt) {
+        this.store.setMeta(`attachments:${channelId}:${sent.id}`, '[]');
+        return { id: sent.id, needsEdit: true };
+      }
+      // An enforced nonce may return a previous send with different attachments.
+      // Record that message's ID so the outbox can reconcile by editing it.
+      const receipt = this.fileReceipt(channelId, sent, prepared.delivery, prepared.files, plan.approvalReview, retryAttachments);
+      return receipt.approvalReview || receipt.retryAttachments ? { id: sent.id, ...receipt } : sent.id;
     } catch (error) {
       if (discordNotFound(error, 10003)) throw new MissingThreadError(channelId);
       throw error;
@@ -478,15 +489,13 @@ export class DiscordAdapter implements ChatPort {
       try { edited = await channel.messages.edit(id, plan.payload); }
       catch (error) {
         retryAttachments = temporaryUploadFailure(error);
-        if ((!uploadRejected(error) && !retryAttachments) || !deliveryFiles(prepared.delivery, prepared.files, this.config.artifacts).length) throw error;
+        if ((!uploadRejected(error) && !retryAttachments) || !plan.payload.files.length) throw error;
         console.error(`Discord file upload rejected: ${compact(String(error), 1000)}`);
         prepared = { delivery: withoutFiles(prepared.delivery, retryAttachments), files: [] };
         plan = prepareDiscordEditPayload(prepared.delivery, [], [], this.config.artifacts);
         edited = await channel.messages.edit(id, plan.payload);
       }
-      // Test adapters and legacy clients may not return a full Discord message.
-      if (edited) this.rememberFiles(channelId, edited, prepared.delivery, prepared.files);
-      return { approvalReview: plan.approvalReview, ...(retryAttachments ? { retryAttachments: true } : {}) };
+      return this.fileReceipt(channelId, edited, prepared.delivery, prepared.files, plan.approvalReview, retryAttachments);
     } catch (error) {
       if (discordNotFound(error, 10003)) throw new MissingThreadError(channelId);
       if (discordNotFound(error, 10008)) throw new MissingMessageError(channelId, id);

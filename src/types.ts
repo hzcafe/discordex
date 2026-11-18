@@ -12,6 +12,7 @@ export interface Packet {
   error?: { code: number; message: string; data?: unknown };
 }
 export interface Thread {
+  ephemeral?: boolean;
   id: string;
   sessionId?: string;
   name?: string | null;
@@ -91,7 +92,8 @@ export interface Binding {
   model?: string | null;
   reasoningEffort?: string | null;
   // Initial history boundary: a binding exports the active turn and future turns.
-  since: number;
+  /** Present in bindings saved before attachment boundaries used only turn IDs. */
+  since?: number;
   initialTurnId: string | null;
   checkpoint: string | null;
 }
@@ -135,7 +137,7 @@ export interface DeliveryReceipt {
 export interface ChatPort {
   createThread(thread: Thread, replacingChannelId?: string): Promise<string>;
   checkThread(channelId: string): Promise<void>;
-  send(channelId: string, delivery: Delivery, nonce: string): Promise<string | (DeliveryReceipt & { id: string })>;
+  send(channelId: string, delivery: Delivery, nonce: string, revisedWithoutReceipt?: boolean): Promise<string | (DeliveryReceipt & { id: string; needsEdit?: true })>;
   edit(channelId: string, messageId: string, delivery: Delivery): Promise<void | DeliveryReceipt>;
 }
 export interface CodexPort {

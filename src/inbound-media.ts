@@ -1,21 +1,20 @@
 import sharp from 'sharp';
-import type { Embed } from 'discord.js';
+import type { Attachment } from 'discord.js';
 import { defaultInbound } from './config.js';
 import { InboundMediaCache, type OriginalMedia, type SavedMedia } from './inbound-cache.js';
 import type { InputImage } from './types.js';
 
-interface Attachment { name: string; url: string; contentType?: string | null; size: number }
-export interface MediaMessage {
-  content?: string;
-  attachments?: { values(): IterableIterator<Attachment> };
-  embeds?: readonly Pick<Embed, 'data' | 'url' | 'image' | 'thumbnail' | 'video'>[];
+export type MessageAttachments = ReadonlyMap<string, Pick<Attachment, 'name' | 'url' | 'contentType' | 'size'>>;
+export interface IncomingMedia {
+  previews: { image: InputImage; caption: string }[];
+  notes: string[];
+  warnings: string[];
+  originals?: SavedMedia[];
 }
-export interface IncomingMedia { images: InputImage[]; notes: string[]; warnings: string[]; originals?: SavedMedia[] }
 export type MediaFetch = (url: string, options: RequestInit) => Promise<Response>;
-interface Candidate { name: string; url?: string; source: string; size?: number; previewURL?: string; unsupported?: boolean; video?: boolean; derivative?: boolean }
 const MiB = 1024 * 1024;
 // These are preview resource limits, separate from configurable original-file limits.
-export const inboundLimits = { files: 4, fileBytes: 8 * MiB, totalBytes: 16 * MiB, pixels: 40_000_000 };
+export const inboundLimits = { fileBytes: 8 * MiB, totalBytes: 16 * MiB, pixels: 40_000_000 };
 const downloadTimeoutMs = 15_000;
 
 export class MediaRetryError extends Error {
@@ -28,20 +27,9 @@ export function discordMediaURL(value: string): string | undefined {
   try {
     const url = new URL(value);
     if (url.protocol !== 'https:' || url.username || url.password || url.port) return;
-    if (!['cdn.discordapp.com', 'media.discordapp.net'].includes(url.hostname) &&
-      !/^images-ext-[12]\.discordapp\.net$/.test(url.hostname)) return;
+    if (!['cdn.discordapp.com', 'media.discordapp.net'].includes(url.hostname)) return;
     return url.href;
   } catch { return; }
-}
-function mediaURL(value: string): string | undefined {
-  const discord = discordMediaURL(value);
-  if (discord) return discord;
-  try {
-    const url = new URL(value);
-    if (url.protocol !== 'https:' || url.username || url.password || url.port) return;
-    // Some providers supply a direct video URL without a Discord video proxy.
-    if (['static.klipy.com', 'media.tenor.com', 'media.giphy.com', 'i.giphy.com'].includes(url.hostname)) return url.href;
-  } catch { /* Not a supported source. */ }
 }
 const label = (value: string) => JSON.stringify(value.replace(/[\r\n\x00-\x1f]/g, ' ').slice(0, 160));
 const sourceURL = (value: string) => {
@@ -66,40 +54,6 @@ function format(bytes: Buffer): (OriginalMedia & { video: boolean }) | undefined
     return { extension: 'webm', mimeType: 'video/webm', video: true };
   }
 }
-function identity(value: string): string {
-  try {
-    const url = new URL(value);
-    return ['cdn.discordapp.com', 'media.discordapp.net'].includes(url.hostname) ? `discord:${url.pathname}` : url.href;
-  } catch { return value; }
-}
-function candidates(message: MediaMessage): Candidate[] {
-  const result: Candidate[] = [];
-  for (const a of message.attachments?.values() ?? []) {
-    const supported = /^(image\/(png|jpe?g|webp|gif|avif)|video\/(mp4|quicktime|webm))$/i.test(a.contentType?.split(';')[0] ?? '') ||
-      /\.(png|jpe?g|webp|gif|avif|mp4|mov|webm)$/i.test(a.name);
-    result.push({ name: a.name, url: a.url, source: sourceURL(a.url), size: a.size, unsupported: !supported });
-  }
-  for (const embed of message.embeds ?? []) {
-    const video = embed.data.type === 'gifv' || embed.data.type === 'video';
-    const media = embed.image ?? (video || embed.data.type === 'image' ? embed.thumbnail : undefined);
-    if (!media && !video) continue;
-    const original = video ? embed.video : media;
-    const source = sourceURL(original?.url ?? embed.url ?? '');
-    const direct = mediaURL(original?.url ?? '');
-    result.push({ name: video ? 'GIF/video' : 'Linked image', video,
-      url: direct ?? original?.proxyURL ?? original?.url ?? undefined, source, derivative: !direct && !video,
-      previewURL: video ? media?.proxyURL ?? media?.url ?? undefined : undefined });
-  }
-  // Direct media links are already usable request data. No sleeps or message refresh.
-  for (const value of message.content?.match(/https:\/\/[^\s<>()[\]]+/g) ?? []) {
-    const url = mediaURL(value);
-    if (!url || !/\.(png|jpe?g|webp|gif|avif|mp4|mov|webm)$/i.test(new URL(url).pathname)) continue;
-    if (result.some(candidate => candidate.url && identity(candidate.url) === identity(url))) continue;
-    result.push({ name: new URL(url).pathname.split('/').at(-1)!, url, source: url });
-  }
-  return result;
-}
-export function hasIncomingMedia(message: MediaMessage): boolean { return candidates(message).length > 0; }
 async function download(url: string, maxBytes: number, fetcher: MediaFetch, spent: (bytes: number) => void): Promise<Buffer> {
   let response: Response;
   try { response = await fetcher(url, { redirect: 'manual', signal: AbortSignal.timeout(downloadTimeoutMs) }); }
@@ -128,23 +82,32 @@ async function download(url: string, maxBytes: number, fetcher: MediaFetch, spen
 }
 
 /** Save original media before deriving optional native-image previews. */
-export async function prepareIncomingMedia(message: MediaMessage, fetcher: MediaFetch = fetch,
+export async function prepareIncomingMedia(attachments: MessageAttachments, fetcher: MediaFetch = fetch,
   context?: { cache: InboundMediaCache; inputId: string }): Promise<IncomingMedia> {
   const limits = context?.cache.limits ?? { ...defaultInbound, maxFileBytes: inboundLimits.fileBytes, maxTotalBytes: inboundLimits.totalBytes };
-  const images: InputImage[] = []; const notes: string[] = []; const warnings: string[] = []; const originals: SavedMedia[] = [];
-  const seen = new Set<string>(); let downloaded = 0; let previewDownloaded = 0; let encoded = 0; let attempted = 0;
-  for (const candidate of candidates(message)) {
-    const key = candidate.url ? identity(candidate.url) : candidate.source;
-    if (seen.has(key)) continue; seen.add(key);
-    const name = label(candidate.name);
-    const source = candidate.source ? ` Source: ${candidate.source}` : '';
+  const previews: IncomingMedia['previews'] = [];
+  const notes: string[] = []; const warnings: string[] = []; const originals: SavedMedia[] = [];
+  let downloaded = 0, encoded = 0, attempted = 0;
+  for (const [attachmentId, file] of attachments) {
+    const key = `attachment:${attachmentId}`;
+    const name = label(file.name);
+    const link = sourceURL(file.url);
+    const source = link ? ` Source: ${link}` : '';
     const warn = (reason: string) => { const text = `${name}: ${reason}.`; warnings.push(text); notes.push(`${text}${source}`); };
-    if (!candidate.unsupported && ++attempted > limits.maxFiles) { warn(`only ${limits.maxFiles} media files per message are supported`); continue; }
+    const supported = /^(image\/(png|jpe?g|webp|gif|avif)|video\/(mp4|quicktime|webm))$/i.test(file.contentType?.split(';')[0] ?? '') ||
+      /\.(png|jpe?g|webp|gif|avif|mp4|mov|webm)$/i.test(file.name);
+    if (!supported) { warn('sent as a link only; this attachment format is not supported'); continue; }
+    if (++attempted > limits.maxFiles) { warn(`only ${limits.maxFiles} media files per message are supported`); continue; }
     let original: Buffer | undefined; let originalFormat: ReturnType<typeof format>; let saved: SavedMedia | undefined;
     try {
-      if (candidate.unsupported) throw new MediaRejected('sent as a link only; this attachment format is not supported');
+      const url = discordMediaURL(file.url);
+      if (!url) throw new MediaRejected('no supported Discord attachment URL was supplied');
       let retained: { saved: SavedMedia; bytes: Buffer } | undefined;
-      try { retained = await context?.cache.lookup(context.inputId, key); }
+      try {
+        // Older installations indexed staged uploads by CDN path. Only look up
+        // that legacy key for a file in the current attachment collection.
+        retained = await context?.cache.lookup(context.inputId, key, `discord:${new URL(url).pathname}`);
+      }
       catch { warn('the previous local copy could not be read; trying the supplied media URL'); }
       if (retained) {
         const budget = Math.min(limits.maxFileBytes, limits.maxTotalBytes - downloaded);
@@ -152,10 +115,8 @@ export async function prepareIncomingMedia(message: MediaMessage, fetcher: Media
         original = retained.bytes; saved = retained.saved; downloaded += original.length;
       }
       else {
-        const url = mediaURL(candidate.url ?? '');
-        if (!url) throw new MediaRejected('no supported original-media URL was supplied');
         const budget = Math.min(limits.maxFileBytes, limits.maxTotalBytes - downloaded);
-        if (budget <= 0 || (candidate.size ?? 0) > budget) throw new MediaRejected(`exceeds the remaining byte limit (${Math.max(0, budget)} bytes)`);
+        if (budget <= 0 || file.size > budget) throw new MediaRejected(`exceeds the remaining byte limit (${Math.max(0, budget)} bytes)`);
         original = await download(url, budget, fetcher, count => { downloaded += count; });
       }
       originalFormat = format(original);
@@ -166,7 +127,7 @@ export async function prepareIncomingMedia(message: MediaMessage, fetcher: Media
         try {
           saved ??= await context.cache.save(context.inputId, key, original, originalFormat);
           originals.push(saved);
-          notes.push(`${candidate.derivative ? 'Discord proxy copy' : 'Original'} ${name}: ${JSON.stringify(saved.path)} (${saved.mimeType}, ${saved.bytes} bytes; retained at least until ${new Date(saved.retainedUntil).toISOString()}).${source}`);
+          notes.push(`Original ${name}: ${JSON.stringify(saved.path)} (${saved.mimeType}, ${saved.bytes} bytes; retained at least until ${new Date(saved.retainedUntil).toISOString()}).${source}`);
         } catch (error) { warn(error instanceof Error ? `original could not be saved: ${error.message}` : 'original could not be saved'); }
       }
     } catch (error) {
@@ -174,35 +135,26 @@ export async function prepareIncomingMedia(message: MediaMessage, fetcher: Media
       if (!(error instanceof MediaRejected)) throw error;
       warn(error.message);
     }
-    // Preview work is independent. Failure must not discard a usable original.
-    let previewBytes = originalFormat && !originalFormat.video ? original : undefined;
-    if (!previewBytes && candidate.previewURL) {
-      try {
-        const url = mediaURL(candidate.previewURL);
-        if (!url) throw new MediaRejected('no supported preview URL was supplied');
-        const budget = Math.min(inboundLimits.fileBytes, inboundLimits.totalBytes - previewDownloaded);
-        if (budget <= 0) throw new MediaRejected('no download budget remains for a preview');
-        previewBytes = await download(url, budget, fetcher, count => { previewDownloaded += count; });
-      } catch (error) { warn(`preview unavailable${saved ? '; original is available locally' : ''}: ${error instanceof Error ? error.message : 'download failed'}`); }
-    }
-    if (!previewBytes) {
-      if (originalFormat?.video) notes.push(`${name}: video has not been viewed; no still preview was supplied.${saved ? ' Use the original file for frame extraction.' : ''}`);
+    if (!original || !originalFormat) continue;
+    if (originalFormat.video) {
+      notes.push(`${name}: video has not been viewed.${saved ? ' Use the original file for frame extraction.' : ''}`);
       continue;
     }
     try {
-      const previewFormat = format(previewBytes);
-      if (!previewFormat || previewFormat.video) throw new Error('download was not a supported raster image');
-      const decoder = sharp(previewBytes, { limitInputPixels: inboundLimits.pixels, pages: 1, failOn: 'error' });
+      const decoder = sharp(original, { limitInputPixels: inboundLimits.pixels, pages: 1, failOn: 'error' });
       const metadata = await decoder.metadata();
       const animated = (metadata.pages ?? 1) > 1 || metadata.format === 'gif';
       const resized = Math.max(metadata.width ?? 0, metadata.height ?? 0) > 2048;
       const output = await decoder.rotate().resize({ width: 2048, height: 2048, fit: 'inside', withoutEnlargement: true }).png().toBuffer();
       if (output.length > inboundLimits.fileBytes || encoded + output.length > inboundLimits.totalBytes) throw new Error('decoded preview exceeds the image byte limit');
-      encoded += output.length; images.push({ type: 'image', url: `data:image/png;base64,${output.toString('base64')}` });
-      const kind = candidate.video ? 'still preview only; animation/video has not been viewed' : animated ? 'first frame only; animation has not been viewed' : 'image';
-      notes.push(`Image ${images.length}: ${name} (${kind}${resized ? '; resized to fit 2048 pixels' : ''}).${source}`);
-      if (saved && !originalFormat?.video) notes.push(`${name}: ${metadata.width}×${metadata.height}, ${metadata.pages ?? 1} frame(s)${metadata.delay ? `, ${metadata.delay.reduce((sum, ms) => sum + ms, 0)} ms per animation cycle` : ''}.`);
+      encoded += output.length;
+      const kind = animated ? 'first frame only; animation has not been viewed' : 'image';
+      previews.push({
+        image: { type: 'image', url: `data:image/png;base64,${output.toString('base64')}` },
+        caption: `Image ${previews.length + 1}: ${name} (${kind}${resized ? '; resized to fit 2048 pixels' : ''}).${source}`,
+      });
+      if (saved) notes.push(`${name}: ${metadata.width}×${metadata.height}, ${metadata.pages ?? 1} frame(s)${metadata.delay ? `, ${metadata.delay.reduce((sum, ms) => sum + ms, 0)} ms per animation cycle` : ''}.`);
     } catch (error) { warn(`preview unavailable${saved ? '; original is available locally' : ''}: ${error instanceof Error ? error.message : 'decoding failed'}`); }
   }
-  return { images, notes, warnings, ...(originals.length ? { originals } : {}) };
+  return { previews, notes, warnings, ...(originals.length ? { originals } : {}) };
 }

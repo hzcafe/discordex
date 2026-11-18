@@ -132,23 +132,24 @@ export class Goals {
     const epoch = this.codex.epoch;
     try {
       if (action === 'clear') {
-        await this.codex.request('thread/goal/clear', params);
+        const response = await this.codex.request<{ cleared: boolean }>('thread/goal/clear', params);
         if (epoch !== this.codex.epoch || !this.codex.connected) throw new Error('Codex disconnected during the goal action');
+        if (typeof response.cleared !== 'boolean') throw new Error('Invalid goal clear response');
         this.publish(binding, null, true);
+        return response.cleared ? 'Goal cleared. Use `/codex stop` to interrupt a running turn.' : 'There was no goal to clear.';
       } else {
         const response = await this.codex.request<{ goal: ThreadGoal }>('thread/goal/set', params);
         if (epoch !== this.codex.epoch || !this.codex.connected) throw new Error('Codex disconnected during the goal action');
         if (!response.goal || response.goal.threadId !== binding.threadId) throw new Error('Invalid goal response');
         this.publish(binding, response.goal, true);
+        if (response.goal.status === 'paused' && action === 'pause') return 'Goal paused. Use `/codex stop` to interrupt a running turn.';
+        const budget = action === 'budget' ? (response.goal.tokenBudget === null ? 'No token budget. ' : `Token budget set to ${number.format(response.goal.tokenBudget)}. `) : '';
+        return `${budget}Goal status: ${statuses[response.goal.status]}.`;
       }
     } catch (error) {
       // Never replay a mutation after an uncertain reply. Read the daemon again.
       this.unavailable(binding, 'Goal action could not be confirmed. Refresh before trying again.');
       throw new Error(`Could not confirm the goal action. Refresh before retrying. ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (action === 'pause') return 'Goal paused. Use `/codex stop` if you also want to interrupt the current turn.';
-    if (action === 'clear') return 'Goal cleared. Any current turn continues until it finishes or you use `/codex stop`.';
-    if (action === 'budget') return 'Goal budget updated. If the goal is stopped, choose Resume when ready.';
-    return action === 'create' ? 'Goal created and activated.' : 'Goal resumed.';
   }
 }

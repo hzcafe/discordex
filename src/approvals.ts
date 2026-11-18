@@ -23,7 +23,7 @@ export function enrichApproval(packet: Packet, item?: Item): Packet {
   const next = structuredClone(packet);
   const p = next.params!;
   if (next.method === 'item/commandExecution/requestApproval' && item?.type === 'commandExecution'
-    && (!p.kind || ['command', 'humanCommand'].includes(p.kind))) {
+    && p.approvalId == null && (!p.kind || ['command', 'humanCommand'].includes(p.kind))) {
     p.command ??= item.command;
     p.cwd ??= item.cwd;
   }

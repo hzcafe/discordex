@@ -97,6 +97,27 @@ test('model controls require an authorized contributor, the original owner/chann
   expect(codex.writes()).toHaveLength(0);
 });
 
+test('an unreported effort stays unset until the user selects one', async () => {
+  const { bridge, codex, act } = fixture();
+  codex.thread.reasoningEffort = null;
+  let picker = await bridge.modelPicker('c1', 'alice');
+  expect(picker.effort).toBeNull();
+  expect(JSON.stringify(modelPickerPayload(picker))).toContain('Effort not reported');
+  picker = await act(picker, 'apply');
+  expect(codex.writes()).toHaveLength(0);
+  picker = await act(picker, 'effort', '0');
+  await act(picker, 'apply');
+  expect(codex.writes()[0]!.params.effort).toBe('low');
+});
+
+test('a provider change during Apply prevents confirmation from a different catalog', async () => {
+  const { bridge, codex, act } = fixture();
+  const picker = await act(await bridge.modelPicker('c1', 'alice'), 'model', '1');
+  codex.afterWrite = async () => { codex.thread.modelProvider = 'other-provider'; };
+  await expect(act(picker, 'apply')).rejects.toThrow('Could not confirm');
+  expect(codex.writes()).toHaveLength(1);
+});
+
 test('old dropdown revisions, external setting changes, expired pickers and reconnects cannot write', async () => {
   const { bridge, codex, act } = fixture();
   const old = await bridge.modelPicker('c1', 'alice');
